@@ -9,6 +9,7 @@ mod error;
 mod jira;
 mod messages;
 mod server;
+mod slack;
 mod svab;
 
 use anyhow::{Context, bail};
