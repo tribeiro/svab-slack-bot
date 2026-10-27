@@ -1,7 +1,8 @@
 //! SVAB Slack bot: posts SVAB ticket updates to Slack, using threads.
 //!
 //! See README.md for the architecture. In short:
-//! `server` (HTTP) --Command--> `actor` (does the work, one command at a time).
+//! `server` (HTTP) --Command--> `actor` (does the work, one command at a time),
+//! which uses `jira` and `slack` clients, `svab::decide` and `messages`.
 
 mod actor;
 mod config;
@@ -20,7 +21,9 @@ use tracing_subscriber::EnvFilter;
 
 use crate::actor::SvabActor;
 use crate::config::Config;
+use crate::jira::JiraClient;
 use crate::server::AppState;
+use crate::slack::SlackClient;
 
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
@@ -33,7 +36,10 @@ async fn main() -> anyhow::Result<()> {
     info!(?config, "starting svab-slack-bot");
 
     let (tx, rx) = mpsc::channel(actor::QUEUE_CAPACITY);
-    let mut actor_task = tokio::spawn(SvabActor::new(rx).run());
+    let jira = JiraClient::new(config.jira.clone())?;
+    let slack = SlackClient::new(slack::SLACK_API_URL, &config.slack.bot_token)?;
+    let actor = SvabActor::new(rx, jira, slack, &config.slack);
+    let mut actor_task = tokio::spawn(actor.run());
 
     let app = server::router(AppState::new(tx, &config));
     let listener = TcpListener::bind(config.bind_addr)

@@ -127,7 +127,6 @@ fn validate_issue_key(key: &str, project: &str) -> Result<(), WebhookError> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::actor::SvabActor;
     use axum::body::Body;
     use axum::http::Request;
     use tower::ServiceExt;
@@ -142,11 +141,20 @@ mod tests {
         }
     }
 
-    /// A router backed by a real, running actor.
-    fn app() -> Router {
-        let (tx, rx) = mpsc::channel(8);
-        tokio::spawn(SvabActor::new(rx).run());
+    /// A router backed by a stand-in actor that answers every command with
+    /// `result`, so these tests exercise only the HTTP layer.
+    fn app_replying(result: fn() -> anyhow::Result<()>) -> Router {
+        let (tx, mut rx) = mpsc::channel(8);
+        tokio::spawn(async move {
+            while let Some(Command::IssueChanged { reply, .. }) = rx.recv().await {
+                let _ = reply.send(result());
+            }
+        });
         router(state(tx))
+    }
+
+    fn app() -> Router {
+        app_replying(|| Ok(()))
     }
 
     fn webhook(auth: Option<&str>, body: &str) -> Request<Body> {
@@ -222,6 +230,14 @@ mod tests {
         let auth = format!("Bearer {SECRET}");
         let response = status(router(state(tx)), webhook(Some(&auth), GOOD_BODY)).await;
         assert_eq!(response, StatusCode::SERVICE_UNAVAILABLE);
+    }
+
+    #[tokio::test]
+    async fn handling_failure_returns_500() {
+        let app = app_replying(|| Err(anyhow::anyhow!("Jira is down")));
+        let auth = format!("Bearer {SECRET}");
+        let response = status(app, webhook(Some(&auth), GOOD_BODY)).await;
+        assert_eq!(response, StatusCode::INTERNAL_SERVER_ERROR);
     }
 
     #[tokio::test]
