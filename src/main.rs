@@ -7,6 +7,7 @@ mod actor;
 mod config;
 mod error;
 mod server;
+mod svab;
 
 use anyhow::{Context, bail};
 use tokio::net::TcpListener;
