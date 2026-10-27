@@ -6,6 +6,7 @@
 mod actor;
 mod config;
 mod error;
+mod messages;
 mod server;
 mod svab;
 
