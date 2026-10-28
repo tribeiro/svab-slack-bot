@@ -92,6 +92,36 @@ post anything that isn't true.
 - **Jira account**: must be able to browse SVAB issues and edit them, because
   setting an issue property requires edit permission.
 
+### Startup checks
+
+Before accepting webhooks, the bot checks its access and exits with an
+explanation if something is wrong:
+
+- **Jira**: `/myself` checks that the credentials are accepted, and
+  `/mypermissions` checks for `BROWSE_PROJECTS` and `EDIT_ISSUES` in the SVAB
+  project.
+- **Slack**: `auth.test` checks that the bot token is valid.
+
+Config values are trimmed, so a stray newline in a secret doesn't matter.
+
+### Troubleshooting Jira auth
+
+Jira Cloud treats requests with rejected credentials as **anonymous**, so
+API calls can fail with a misleading *404 "Issue does not exist or you do not
+have permission to see it"* instead of 401. The startup check catches this
+case. To test credentials by hand:
+
+```sh
+curl -s -o /dev/null -w '%{http_code}\n' -u "$SVAB_BOT_JIRA_EMAIL:$SVAB_BOT_JIRA_API_TOKEN" \
+  "$SVAB_BOT_JIRA_SITE_URL/rest/api/3/myself"
+```
+
+- **401**: the email must be the Atlassian login of the account that owns the
+  token. Service accounts have a generated email. The token may also have
+  expired.
+- **401 here, but 200 via `https://api.atlassian.com/ex/jira/<cloud-id>`**:
+  the token is scoped. Set `SVAB_BOT_JIRA_API_URL` to that gateway URL.
+
 ## Running locally
 
 Point `SVAB_BOT_SLACK_CHANNEL_ID` at a **test channel**.
