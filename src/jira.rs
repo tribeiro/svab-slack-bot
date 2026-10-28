@@ -1,9 +1,10 @@
-//! Minimal Jira Cloud REST client: read an issue, and read/write the issue
-//! property where the bot keeps its [`ThreadState`].
+//! Minimal Jira Cloud REST client: check our access, read an issue, and
+//! read/write the issue property where the bot keeps its [`ThreadState`].
 //!
 //! Jira's JSON is mapped into private `Raw*` structs that mirror the API, then
 //! converted into the domain [`Issue`]. Only this module knows Jira's shapes.
 
+use std::collections::HashMap;
 use std::time::Duration;
 
 use anyhow::{Context, bail};
@@ -20,6 +21,10 @@ const PROPERTY_KEY: &str = "svab-slack-bot";
 const FIELD_PLANNED_DEPLOYMENT: &str = "customfield_12307";
 const FIELD_CHANGE_CONTENTS: &str = "customfield_12306";
 
+/// Project permissions the bot needs: see issues, and set issue properties
+/// (which Jira counts as editing the issue).
+const REQUIRED_PERMISSIONS: [&str; 2] = ["BROWSE_PROJECTS", "EDIT_ISSUES"];
+
 /// Don't let a slow Jira block the actor forever.
 const TIMEOUT: Duration = Duration::from_secs(15);
 
@@ -33,6 +38,60 @@ impl JiraClient {
     pub fn new(config: JiraConfig) -> anyhow::Result<Self> {
         let http = reqwest::Client::builder().timeout(TIMEOUT).build()?;
         Ok(Self { http, config })
+    }
+
+    /// Check that our credentials work and that the account has the
+    /// permissions the bot needs in `project`. Returns the account's display
+    /// name. Called at startup so misconfiguration fails fast and clearly.
+    pub async fn verify_access(&self, project: &str) -> anyhow::Result<String> {
+        let response = self
+            .http
+            .get(format!("{}/rest/api/3/myself", self.config.api_url))
+            .basic_auth(&self.config.email, Some(&self.config.api_token))
+            .send()
+            .await;
+        let me: RawUser = check_status(response)
+            .await
+            .context("GET /myself")?
+            .json()
+            .await
+            .context("parsing /myself")?;
+
+        let url = format!(
+            "{}/rest/api/3/mypermissions?projectKey={project}&permissions={}",
+            self.config.api_url,
+            REQUIRED_PERMISSIONS.join(",")
+        );
+        let response = self
+            .http
+            .get(&url)
+            .basic_auth(&self.config.email, Some(&self.config.api_token))
+            .send()
+            .await;
+        let granted: RawPermissions = check_status(response)
+            .await
+            .context("GET /mypermissions")?
+            .json()
+            .await
+            .context("parsing /mypermissions")?;
+
+        let missing: Vec<&str> = REQUIRED_PERMISSIONS
+            .into_iter()
+            .filter(|name| {
+                !granted
+                    .permissions
+                    .get(*name)
+                    .is_some_and(|permission| permission.have_permission)
+            })
+            .collect();
+        if !missing.is_empty() {
+            bail!(
+                "Jira account {} lacks permissions in project {project}: {}",
+                me.display_name,
+                missing.join(", ")
+            );
+        }
+        Ok(me.display_name)
     }
 
     /// Fetch an issue and convert it to the domain type.
@@ -190,6 +249,17 @@ struct RawOption {
 }
 
 #[derive(Deserialize)]
+struct RawPermissions {
+    permissions: HashMap<String, RawPermission>,
+}
+
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct RawPermission {
+    have_permission: bool,
+}
+
+#[derive(Deserialize)]
 struct RawProperty {
     value: ThreadState,
 }
@@ -255,6 +325,68 @@ pub mod tests {
             api_token: "token".into(),
         })
         .unwrap()
+    }
+
+    async fn mount_access(server: &MockServer, browse: bool, edit: bool) {
+        Mock::given(path("/rest/api/3/myself"))
+            .and(basic_auth("bot@example.com", "token"))
+            .respond_with(
+                ResponseTemplate::new(200).set_body_json(json!({"displayName": "SVAB Bot"})),
+            )
+            .mount(server)
+            .await;
+        Mock::given(path("/rest/api/3/mypermissions"))
+            .and(query_param("projectKey", "SVAB"))
+            .and(query_param("permissions", "BROWSE_PROJECTS,EDIT_ISSUES"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+                "permissions": {
+                    "BROWSE_PROJECTS": {"key": "BROWSE_PROJECTS", "havePermission": browse},
+                    "EDIT_ISSUES": {"key": "EDIT_ISSUES", "havePermission": edit}
+                }
+            })))
+            .mount(server)
+            .await;
+    }
+
+    #[tokio::test]
+    async fn verify_access_returns_account_name() {
+        let server = MockServer::start().await;
+        mount_access(&server, true, true).await;
+
+        let name = client(&server).await.verify_access("SVAB").await.unwrap();
+        assert_eq!(name, "SVAB Bot");
+    }
+
+    #[tokio::test]
+    async fn verify_access_reports_missing_permissions() {
+        let server = MockServer::start().await;
+        mount_access(&server, true, false).await;
+
+        let err = client(&server)
+            .await
+            .verify_access("SVAB")
+            .await
+            .unwrap_err();
+        assert!(
+            err.to_string()
+                .contains("lacks permissions in project SVAB: EDIT_ISSUES")
+        );
+    }
+
+    #[tokio::test]
+    async fn verify_access_reports_bad_credentials() {
+        let server = MockServer::start().await;
+        Mock::given(path("/rest/api/3/myself"))
+            .respond_with(ResponseTemplate::new(401))
+            .mount(&server)
+            .await;
+
+        let err = client(&server)
+            .await
+            .verify_access("SVAB")
+            .await
+            .unwrap_err();
+        assert!(format!("{err:#}").contains("Jira rejected the credentials"));
     }
 
     #[tokio::test]

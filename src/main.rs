@@ -37,6 +37,13 @@ async fn main() -> anyhow::Result<()> {
 
     let (tx, rx) = mpsc::channel(actor::QUEUE_CAPACITY);
     let jira = JiraClient::new(config.jira.clone())?;
+    // Fail now on bad credentials or missing permissions, with a clear error,
+    // rather than on the first webhook.
+    let jira_account = jira
+        .verify_access(&config.jira_project)
+        .await
+        .context("Jira startup check failed")?;
+    info!(account = %jira_account, "Jira access OK");
     let slack = SlackClient::new(slack::SLACK_API_URL, &config.slack.bot_token)?;
     let actor = SvabActor::new(rx, jira, slack, &config.slack);
     let mut actor_task = tokio::spawn(actor.run());
