@@ -67,6 +67,14 @@ impl Config {
     /// Load the config using `lookup` to fetch variables. Split out from
     /// [`Config::from_env`] so tests don't have to modify the real environment.
     fn from_lookup(lookup: impl Fn(&str) -> Option<String>) -> anyhow::Result<Self> {
+        // Values pasted from a file or a secret often carry a stray newline or
+        // space, which makes tokens fail in confusing ways. Trim them, and
+        // treat a blank value as unset.
+        let lookup = |name: &str| {
+            lookup(name)
+                .map(|value| value.trim().to_string())
+                .filter(|value| !value.is_empty())
+        };
         let required = |name: &str| lookup(name).with_context(|| format!("{name} is not set"));
 
         let bind_addr = lookup("SVAB_BOT_BIND_ADDR")
@@ -202,6 +210,21 @@ mod tests {
             let err = load(&vars).unwrap_err();
             assert!(err.to_string().contains(name), "{name}: {err}");
         }
+    }
+
+    #[test]
+    fn values_are_trimmed_and_blank_means_unset() {
+        let mut vars = required_vars();
+        vars.insert("SVAB_BOT_JIRA_EMAIL", "  bot@example.com\n");
+        let config = load(&vars).unwrap();
+        assert_eq!(config.jira.email, "bot@example.com");
+
+        vars.insert("SVAB_BOT_JIRA_API_TOKEN", " \n");
+        let err = load(&vars).unwrap_err();
+        assert!(
+            err.to_string()
+                .contains("SVAB_BOT_JIRA_API_TOKEN is not set")
+        );
     }
 
     #[test]
