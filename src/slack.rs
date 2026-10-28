@@ -1,4 +1,4 @@
-//! Minimal Slack Web API client: just `chat.postMessage`.
+//! Minimal Slack Web API client: `auth.test` and `chat.postMessage`.
 //!
 //! Slack returns HTTP 200 even for failures; the real result is the `ok` field
 //! in the JSON body, with the reason in `error` (e.g. `channel_not_found`).
@@ -29,6 +29,37 @@ impl SlackClient {
             api_url: api_url.trim_end_matches('/').to_string(),
             bot_token: bot_token.to_string(),
         })
+    }
+
+    /// Check that the bot token works. Returns the bot's user name and
+    /// workspace. Called at startup so a bad token fails fast and clearly.
+    pub async fn verify_access(&self) -> anyhow::Result<String> {
+        let response: AuthTestResponse = self
+            .http
+            .post(format!("{}/auth.test", self.api_url))
+            .bearer_auth(&self.bot_token)
+            .send()
+            .await
+            .context("auth.test")?
+            .error_for_status()
+            .context("auth.test")?
+            .json()
+            .await
+            .context("parsing auth.test response")?;
+
+        match response {
+            AuthTestResponse {
+                ok: true,
+                user: Some(user),
+                team,
+                ..
+            } => Ok(format!("{user} in {}", team.as_deref().unwrap_or("?"))),
+            AuthTestResponse { error, .. } => bail!(
+                "Slack rejected the bot token ({}); check SVAB_BOT_SLACK_BOT_TOKEN \
+                 is the app's Bot User OAuth Token (xoxb-...)",
+                error.as_deref().unwrap_or("unknown error")
+            ),
+        }
     }
 
     /// Post a message, as a thread reply if `thread_ts` is given.
@@ -84,6 +115,14 @@ struct PostMessage<'a> {
 }
 
 #[derive(Deserialize)]
+struct AuthTestResponse {
+    ok: bool,
+    user: Option<String>,
+    team: Option<String>,
+    error: Option<String>,
+}
+
+#[derive(Deserialize)]
 struct PostMessageResponse {
     ok: bool,
     ts: Option<String>,
@@ -96,6 +135,41 @@ mod tests {
     use serde_json::json;
     use wiremock::matchers::{body_partial_json, header, method, path};
     use wiremock::{Mock, MockServer, ResponseTemplate};
+
+    #[tokio::test]
+    async fn verify_access_returns_bot_identity() {
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/auth.test"))
+            .and(header("authorization", "Bearer xoxb-test"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(
+                json!({"ok": true, "user": "svab-bot", "team": "Rubin Obs", "user_id": "U1"}),
+            ))
+            .mount(&server)
+            .await;
+
+        let slack = SlackClient::new(&server.uri(), "xoxb-test").unwrap();
+        assert_eq!(
+            slack.verify_access().await.unwrap(),
+            "svab-bot in Rubin Obs"
+        );
+    }
+
+    #[tokio::test]
+    async fn verify_access_reports_bad_token() {
+        let server = MockServer::start().await;
+        Mock::given(path("/auth.test"))
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .set_body_json(json!({"ok": false, "error": "invalid_auth"})),
+            )
+            .mount(&server)
+            .await;
+
+        let slack = SlackClient::new(&server.uri(), "xoxb-test").unwrap();
+        let err = slack.verify_access().await.unwrap_err().to_string();
+        assert!(err.contains("invalid_auth") && err.contains("SVAB_BOT_SLACK_BOT_TOKEN"));
+    }
 
     #[tokio::test]
     async fn posts_thread_reply_and_returns_ts() {

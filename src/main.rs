@@ -45,6 +45,11 @@ async fn main() -> anyhow::Result<()> {
         .context("Jira startup check failed")?;
     info!(account = %jira_account, "Jira access OK");
     let slack = SlackClient::new(slack::SLACK_API_URL, &config.slack.bot_token)?;
+    let slack_account = slack
+        .verify_access()
+        .await
+        .context("Slack startup check failed")?;
+    info!(account = %slack_account, "Slack access OK");
     let actor = SvabActor::new(rx, jira, slack, &config.slack);
     let mut actor_task = tokio::spawn(actor.run());
 
