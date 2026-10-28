@@ -6,8 +6,8 @@
 
 use std::time::Duration;
 
-use anyhow::Context;
-use reqwest::StatusCode;
+use anyhow::{Context, bail};
+use reqwest::{Response, StatusCode};
 use serde::Deserialize;
 
 use crate::config::JiraConfig;
@@ -53,14 +53,14 @@ impl JiraClient {
             self.config.api_url
         );
 
-        let raw: RawIssue = self
+        let response = self
             .http
             .get(&url)
             .basic_auth(&self.config.email, Some(&self.config.api_token))
             .send()
+            .await;
+        let raw: RawIssue = check_status(response)
             .await
-            .with_context(|| format!("GET issue {key}"))?
-            .error_for_status()
             .with_context(|| format!("GET issue {key}"))?
             .json()
             .await
@@ -83,8 +83,8 @@ impl JiraClient {
             return Ok(None);
         }
 
-        let property: RawProperty = response
-            .error_for_status()
+        let property: RawProperty = check_status(Ok(response))
+            .await
             .with_context(|| format!("GET thread state of {key}"))?
             .json()
             .await
@@ -94,14 +94,15 @@ impl JiraClient {
 
     /// Store (create or replace) the bot's thread state on an issue.
     pub async fn set_thread_state(&self, key: &str, state: &ThreadState) -> anyhow::Result<()> {
-        self.http
+        let response = self
+            .http
             .put(self.property_url(key))
             .basic_auth(&self.config.email, Some(&self.config.api_token))
             .json(state)
             .send()
+            .await;
+        check_status(response)
             .await
-            .with_context(|| format!("PUT thread state of {key}"))?
-            .error_for_status()
             .with_context(|| format!("PUT thread state of {key}"))?;
         Ok(())
     }
@@ -114,7 +115,42 @@ impl JiraClient {
     }
 }
 
+/// Turn a failed request or a non-2xx response into an error that includes
+/// Jira's own explanation, e.g. "Issue does not exist or you do not have
+/// permission to see it." (`reqwest`'s `error_for_status` drops the body.)
+async fn check_status(response: reqwest::Result<Response>) -> anyhow::Result<Response> {
+    let response = response?;
+    let status = response.status();
+    if status.is_success() {
+        return Ok(response);
+    }
+
+    let body = response.text().await.unwrap_or_default();
+    let detail = serde_json::from_str::<RawErrors>(&body)
+        .map(|errors| errors.error_messages.join("; "))
+        .ok()
+        .filter(|messages| !messages.is_empty())
+        .unwrap_or_else(|| body.chars().take(200).collect());
+
+    if status == StatusCode::UNAUTHORIZED {
+        bail!(
+            "Jira rejected the credentials (401): {detail}. Check that SVAB_BOT_JIRA_EMAIL \
+             is the Atlassian login of the account that owns SVAB_BOT_JIRA_API_TOKEN, and that \
+             the token hasn't expired. Scoped (e.g. service account) tokens also need \
+             SVAB_BOT_JIRA_API_URL=https://api.atlassian.com/ex/jira/<cloud-id>"
+        );
+    }
+    bail!("Jira returned {status}: {detail}")
+}
+
 // --- Jira JSON shapes (only the fields we use) ---
+
+/// Error body Jira sends with most 4xx responses.
+#[derive(Deserialize)]
+struct RawErrors {
+    #[serde(rename = "errorMessages", default)]
+    error_messages: Vec<String>,
+}
 
 #[derive(Deserialize)]
 struct RawIssue {
@@ -257,14 +293,41 @@ pub mod tests {
     }
 
     #[tokio::test]
-    async fn get_issue_reports_http_errors() {
+    async fn get_issue_errors_include_jira_explanation() {
         let server = MockServer::start().await;
         Mock::given(path("/rest/api/3/issue/SVAB-15"))
-            .respond_with(ResponseTemplate::new(403))
+            .respond_with(ResponseTemplate::new(404).set_body_json(json!({
+                "errorMessages": ["Issue does not exist or you do not have permission to see it."],
+                "errors": {}
+            })))
             .mount(&server)
             .await;
 
-        assert!(client(&server).await.get_issue("SVAB-15").await.is_err());
+        let err = client(&server)
+            .await
+            .get_issue("SVAB-15")
+            .await
+            .unwrap_err();
+        let message = format!("{err:#}");
+        assert!(message.contains("GET issue SVAB-15"), "{message}");
+        assert!(message.contains("404"), "{message}");
+        assert!(message.contains("do not have permission"), "{message}");
+    }
+
+    #[tokio::test]
+    async fn unauthorized_errors_explain_what_to_check() {
+        let server = MockServer::start().await;
+        Mock::given(path("/rest/api/3/issue/SVAB-15"))
+            .respond_with(ResponseTemplate::new(401).set_body_string("Unauthorized"))
+            .mount(&server)
+            .await;
+
+        let err = client(&server)
+            .await
+            .get_issue("SVAB-15")
+            .await
+            .unwrap_err();
+        assert!(format!("{err:#}").contains("SVAB_BOT_JIRA_EMAIL"));
     }
 
     #[tokio::test]
