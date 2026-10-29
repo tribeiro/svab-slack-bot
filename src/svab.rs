@@ -123,16 +123,44 @@ pub enum Action {
     /// Post the review request to the channel, save the thread, then post
     /// the details in the thread.
     Announce,
+    /// The ticket went through review after the cutover but was never
+    /// announced (e.g. the bot was down the whole time). Don't post late;
+    /// just log a warning.
+    WarnNeverAnnounced,
 }
 
-/// Decide what to post, given the ticket and what we already posted.
-pub fn decide(issue: &Issue, thread: Option<&ThreadState>) -> Vec<Action> {
-    match (&issue.status, thread) {
-        // First time the ticket is ready for review: announce it.
-        (Status::InReview, None) => vec![Action::Announce],
-        // Already announced, or not ready for review yet. Thread updates for
-        // later statuses come in a later milestone.
-        _ => vec![],
+/// Decide what to post, given the ticket, what we already posted, and the
+/// cutover time (`announce_since`) before which the old Jira plugin was
+/// announcing tickets.
+pub fn decide(
+    issue: &Issue,
+    thread: Option<&ThreadState>,
+    announce_since: Option<Timestamp>,
+) -> Vec<Action> {
+    if thread.is_some() {
+        // Already announced. Thread updates for later statuses come in a
+        // later milestone.
+        return vec![];
+    }
+
+    // From here on, the bot has never posted about this ticket.
+    let reviewed_before_cutover = match (issue.entered_review_at, announce_since) {
+        (Some(entered), Some(since)) => entered < since,
+        _ => false,
+    };
+    if reviewed_before_cutover {
+        // The old plugin announced it; posting again would be a duplicate.
+        return vec![];
+    }
+
+    match (&issue.status, issue.entered_review_at) {
+        // Ready for review: announce it. This includes an unknown entry time,
+        // since a duplicate announcement is better than a missing one.
+        (Status::InReview, _) => vec![Action::Announce],
+        // Past review without ever being announced.
+        (_, Some(_)) => vec![Action::WarnNeverAnnounced],
+        // Not in review yet.
+        (_, None) => vec![],
     }
 }
 
@@ -200,28 +228,76 @@ pub mod tests {
 
     #[test]
     fn announces_when_in_review_without_thread() {
-        assert_eq!(decide(&example_issue(), None), vec![Action::Announce]);
+        assert_eq!(decide(&example_issue(), None, None), vec![Action::Announce]);
     }
 
     #[test]
     fn does_not_announce_twice() {
         let state = thread(Status::InReview);
-        assert!(decide(&example_issue(), Some(&state)).is_empty());
+        assert!(decide(&example_issue(), Some(&state), None).is_empty());
     }
 
     #[test]
-    fn ignores_tickets_not_in_review() {
-        for status in [
-            Status::Open,
-            Status::InProgress,
-            Status::Tested,
-            Status::Done,
-        ] {
+    fn ignores_tickets_never_in_review() {
+        for status in [Status::Open, Status::InProgress, Status::Tested] {
+            let issue = Issue {
+                status,
+                entered_review_at: None,
+                ..example_issue()
+            };
+            assert!(decide(&issue, None, None).is_empty());
+        }
+    }
+
+    // example_issue() entered review at 2026-10-26T15:59:31.727Z.
+
+    fn at(timestamp: &str) -> Option<Timestamp> {
+        Some(timestamp.parse().unwrap())
+    }
+
+    #[test]
+    fn cutover_skips_tickets_reviewed_before_it() {
+        let since = at("2026-11-01T00:00:00Z");
+        assert!(decide(&example_issue(), None, since).is_empty());
+
+        let done = Issue {
+            status: Status::Done,
+            ..example_issue()
+        };
+        assert!(decide(&done, None, since).is_empty());
+    }
+
+    #[test]
+    fn cutover_announces_tickets_reviewed_after_it() {
+        let since = at("2026-10-01T00:00:00Z");
+        assert_eq!(
+            decide(&example_issue(), None, since),
+            vec![Action::Announce]
+        );
+    }
+
+    #[test]
+    fn announces_when_review_time_is_unknown() {
+        let issue = Issue {
+            entered_review_at: None,
+            ..example_issue()
+        };
+        let since = at("2026-11-01T00:00:00Z");
+        assert_eq!(decide(&issue, None, since), vec![Action::Announce]);
+    }
+
+    #[test]
+    fn warns_about_tickets_that_skipped_the_announcement() {
+        let since = at("2026-10-01T00:00:00Z");
+        for status in [Status::Approved, Status::Done, Status::Cancelled] {
             let issue = Issue {
                 status,
                 ..example_issue()
             };
-            assert!(decide(&issue, None).is_empty());
+            assert_eq!(
+                decide(&issue, None, since),
+                vec![Action::WarnNeverAnnounced]
+            );
         }
     }
 }

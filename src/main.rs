@@ -16,7 +16,7 @@ mod svab;
 use anyhow::{Context, bail};
 use tokio::net::TcpListener;
 use tokio::sync::mpsc;
-use tracing::info;
+use tracing::{info, warn};
 use tracing_subscriber::EnvFilter;
 
 use crate::actor::SvabActor;
@@ -50,7 +50,13 @@ async fn main() -> anyhow::Result<()> {
         .await
         .context("Slack startup check failed")?;
     info!(account = %slack_account, "Slack access OK");
-    let actor = SvabActor::new(rx, jira, slack, &config.slack);
+    if config.announce_since.is_none() {
+        warn!(
+            "SVAB_BOT_ANNOUNCE_SINCE is not set: tickets already announced by the \
+             old Jira plugin may be announced again"
+        );
+    }
+    let actor = SvabActor::new(rx, jira, slack, &config.slack, config.announce_since);
     let mut actor_task = tokio::spawn(actor.run());
 
     let app = server::router(AppState::new(tx, &config));
