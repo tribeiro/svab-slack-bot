@@ -9,8 +9,10 @@
 
 use std::fmt;
 use std::net::SocketAddr;
+use std::time::Duration;
 
 use anyhow::{Context, bail};
+use jiff::Timestamp;
 
 /// Shortest webhook secret we accept. Generate one with `openssl rand -hex 32`.
 const MIN_SECRET_LEN: usize = 32;
@@ -25,8 +27,14 @@ pub struct Config {
     /// Jira project key that webhook issue keys must belong to
     /// (`SVAB_BOT_JIRA_PROJECT`, default `SVAB`).
     pub jira_project: String,
+    /// Cutover time: tickets that entered In Review before this were announced
+    /// by the old Jira plugin, so the bot never announces them
+    /// (`SVAB_BOT_ANNOUNCE_SINCE`, RFC 3339 such as `2026-11-03T15:00:00Z`,
+    /// optional; unset means no guard).
+    pub announce_since: Option<Timestamp>,
     pub jira: JiraConfig,
     pub slack: SlackConfig,
+    pub reconcile: ReconcileConfig,
 }
 
 /// How to reach Jira, and as whom.
@@ -56,6 +64,16 @@ pub struct SlackConfig {
     pub approvers_group_id: String,
     /// User group ID (`S...`) of @svab-main (`SVAB_BOT_SLACK_MAIN_GROUP_ID`, required).
     pub main_group_id: String,
+}
+
+/// How the reconciler catches up on events missed while the bot was down.
+#[derive(Debug, Clone)]
+pub struct ReconcileConfig {
+    /// Time between passes (`SVAB_BOT_RECONCILE_INTERVAL_MINUTES`, default 15).
+    pub interval: Duration,
+    /// Only tickets updated within this many hours are checked
+    /// (`SVAB_BOT_RECONCILE_LOOKBACK_HOURS`, default 72).
+    pub lookback_hours: u32,
 }
 
 impl Config {
@@ -89,6 +107,14 @@ impl Config {
 
         let jira_project = lookup("SVAB_BOT_JIRA_PROJECT").unwrap_or_else(|| "SVAB".to_string());
 
+        let announce_since = lookup("SVAB_BOT_ANNOUNCE_SINCE")
+            .map(|value| {
+                value.parse::<Timestamp>().with_context(|| {
+                    format!("SVAB_BOT_ANNOUNCE_SINCE must be RFC 3339, e.g. 2026-11-03T15:00:00Z; got {value:?}")
+                })
+            })
+            .transpose()?;
+
         // Trailing slashes would give `//rest/...` URLs.
         let site_url = required("SVAB_BOT_JIRA_SITE_URL")?
             .trim_end_matches('/')
@@ -110,12 +136,35 @@ impl Config {
             main_group_id: required("SVAB_BOT_SLACK_MAIN_GROUP_ID")?,
         };
 
+        let positive = |name: &str, default: u32| match lookup(name) {
+            None => Ok(default),
+            Some(value) => match value.parse::<u32>() {
+                Ok(number) if number > 0 => Ok(number),
+                _ => bail!("{name} must be a positive whole number, got {value:?}"),
+            },
+        };
+        let interval_minutes = positive("SVAB_BOT_RECONCILE_INTERVAL_MINUTES", 15)?;
+        let lookback_hours = positive("SVAB_BOT_RECONCILE_LOOKBACK_HOURS", 72)?;
+        // Otherwise tickets updated between two passes could be missed.
+        if u64::from(lookback_hours) * 60 < u64::from(interval_minutes) {
+            bail!(
+                "SVAB_BOT_RECONCILE_LOOKBACK_HOURS ({lookback_hours} h) must cover \
+                 SVAB_BOT_RECONCILE_INTERVAL_MINUTES ({interval_minutes} min)"
+            );
+        }
+        let reconcile = ReconcileConfig {
+            interval: Duration::from_secs(u64::from(interval_minutes) * 60),
+            lookback_hours,
+        };
+
         Ok(Self {
             bind_addr,
             webhook_secret,
             jira_project,
+            announce_since,
             jira,
             slack,
+            reconcile,
         })
     }
 }
@@ -128,8 +177,10 @@ impl fmt::Debug for Config {
             .field("bind_addr", &self.bind_addr)
             .field("webhook_secret", &"<redacted>")
             .field("jira_project", &self.jira_project)
+            .field("announce_since", &self.announce_since)
             .field("jira", &self.jira)
             .field("slack", &self.slack)
+            .field("reconcile", &self.reconcile)
             .finish()
     }
 }
@@ -189,6 +240,49 @@ mod tests {
         // Trailing slash trimmed, and the API URL defaults to the site URL.
         assert_eq!(config.jira.site_url, "https://example.atlassian.net");
         assert_eq!(config.jira.api_url, "https://example.atlassian.net");
+        assert_eq!(config.announce_since, None);
+        assert_eq!(config.reconcile.interval, Duration::from_secs(15 * 60));
+        assert_eq!(config.reconcile.lookback_hours, 72);
+    }
+
+    #[test]
+    fn announce_since_is_parsed() {
+        let mut vars = required_vars();
+        vars.insert("SVAB_BOT_ANNOUNCE_SINCE", "2026-11-03T08:00:00-07:00");
+        let config = load(&vars).unwrap();
+        assert_eq!(
+            config.announce_since,
+            Some("2026-11-03T15:00:00Z".parse().unwrap())
+        );
+
+        vars.insert("SVAB_BOT_ANNOUNCE_SINCE", "next tuesday");
+        assert!(load(&vars).is_err());
+    }
+
+    #[test]
+    fn reconcile_settings_are_validated() {
+        let mut vars = required_vars();
+        vars.insert("SVAB_BOT_RECONCILE_INTERVAL_MINUTES", "5");
+        vars.insert("SVAB_BOT_RECONCILE_LOOKBACK_HOURS", "24");
+        let config = load(&vars).unwrap();
+        assert_eq!(config.reconcile.interval, Duration::from_secs(5 * 60));
+        assert_eq!(config.reconcile.lookback_hours, 24);
+
+        for (name, bad) in [
+            ("SVAB_BOT_RECONCILE_INTERVAL_MINUTES", "0"),
+            ("SVAB_BOT_RECONCILE_INTERVAL_MINUTES", "-5"),
+            ("SVAB_BOT_RECONCILE_LOOKBACK_HOURS", "a day"),
+        ] {
+            let mut vars = required_vars();
+            vars.insert(name, bad);
+            assert!(load(&vars).is_err(), "{name}={bad}");
+        }
+
+        // A lookback shorter than the interval could miss tickets.
+        let mut vars = required_vars();
+        vars.insert("SVAB_BOT_RECONCILE_INTERVAL_MINUTES", "120");
+        vars.insert("SVAB_BOT_RECONCILE_LOOKBACK_HOURS", "1");
+        assert!(load(&vars).is_err());
     }
 
     #[test]
