@@ -8,6 +8,7 @@ use std::collections::HashMap;
 use std::time::Duration;
 
 use anyhow::{Context, bail};
+use jiff::Timestamp;
 use reqwest::{Response, StatusCode};
 use serde::Deserialize;
 
@@ -108,7 +109,7 @@ impl JiraClient {
         ]
         .join(",");
         let url = format!(
-            "{}/rest/api/3/issue/{key}?fields={fields}",
+            "{}/rest/api/3/issue/{key}?fields={fields}&expand=changelog",
             self.config.api_url
         );
 
@@ -215,6 +216,31 @@ struct RawErrors {
 struct RawIssue {
     key: String,
     fields: RawFields,
+    /// Present because we ask for `expand=changelog`. Jira includes the most
+    /// recent 100 entries, newest first; SVAB tickets have far fewer.
+    #[serde(default)]
+    changelog: RawChangelog,
+}
+
+#[derive(Deserialize, Default)]
+struct RawChangelog {
+    histories: Vec<RawHistory>,
+}
+
+/// One edit of the ticket, possibly changing several fields at once.
+#[derive(Deserialize)]
+struct RawHistory {
+    created: Timestamp,
+    items: Vec<RawChangeItem>,
+}
+
+#[derive(Deserialize)]
+struct RawChangeItem {
+    #[serde(rename = "fieldId")]
+    field_id: Option<String>,
+    /// New value as displayed, e.g. the new status name.
+    #[serde(rename = "toString")]
+    to_name: Option<String>,
 }
 
 #[derive(Deserialize)]
@@ -266,6 +292,7 @@ struct RawProperty {
 
 impl RawIssue {
     fn into_issue(self, site_url: &str) -> Issue {
+        let entered_review_at = self.changelog.last_entered(&Status::InReview);
         let fields = self.fields;
         Issue {
             url: format!("{site_url}/browse/{}", self.key),
@@ -287,7 +314,27 @@ impl RawIssue {
                 .into_iter()
                 .map(|option| option.value)
                 .collect(),
+            entered_review_at,
         }
+    }
+}
+
+impl RawChangelog {
+    /// When the ticket most recently moved into `status`, if ever.
+    fn last_entered(&self, status: &Status) -> Option<Timestamp> {
+        self.histories
+            .iter()
+            .filter(|history| {
+                history.items.iter().any(|item| {
+                    item.field_id.as_deref() == Some("status")
+                        && item
+                            .to_name
+                            .as_ref()
+                            .is_some_and(|name| Status::from(name.clone()) == *status)
+                })
+            })
+            .map(|history| history.created)
+            .max()
     }
 }
 
@@ -313,8 +360,58 @@ pub mod tests {
                 "labels": [],
                 "customfield_12307": "2026-10-27",
                 "customfield_12306": [{"value": "CSC software", "id": "13166"}]
+            },
+            "changelog": {
+                "startAt": 0, "maxResults": 2, "total": 2,
+                "histories": [
+                    {
+                        "created": "2026-10-26T08:59:31.727-0700",
+                        "items": [{"field": "status", "fieldId": "status",
+                                   "fromString": "Tested", "toString": "In Review"}]
+                    },
+                    {
+                        "created": "2026-10-26T08:58:29.564-0700",
+                        "items": [{"field": "Change Contents", "fieldId": "customfield_12306",
+                                   "toString": "CSC software"}]
+                    }
+                ]
             }
         })
+    }
+
+    /// Changelog with the given (time, new status) entries, newest first.
+    fn changelog(entries: &[(&str, &str)]) -> RawChangelog {
+        let histories = entries
+            .iter()
+            .map(|(created, status)| {
+                json!({"created": created, "items": [{"fieldId": "status", "toString": status}]})
+            })
+            .collect::<Vec<_>>();
+        serde_json::from_value(json!({ "histories": histories })).unwrap()
+    }
+
+    #[test]
+    fn last_entered_review_uses_most_recent_entry() {
+        // Reviewed, reworked, then resubmitted.
+        let log = changelog(&[
+            ("2026-10-25T10:00:00.000-0700", "In Review"),
+            ("2026-10-24T10:00:00.000-0700", "In Progress"),
+            ("2026-10-22T10:00:00.000-0700", "In Review"),
+        ]);
+        assert_eq!(
+            log.last_entered(&Status::InReview),
+            Some("2026-10-25T17:00:00Z".parse().unwrap())
+        );
+    }
+
+    #[test]
+    fn last_entered_review_is_none_if_never_reviewed() {
+        let log = changelog(&[("2026-10-24T10:00:00.000-0700", "In Progress")]);
+        assert_eq!(log.last_entered(&Status::InReview), None);
+        assert_eq!(
+            RawChangelog::default().last_entered(&Status::InReview),
+            None
+        );
     }
 
     async fn client(server: &MockServer) -> JiraClient {
@@ -395,6 +492,7 @@ pub mod tests {
         Mock::given(method("GET"))
             .and(path("/rest/api/3/issue/SVAB-15"))
             .and(query_param("fields", "summary,status,priority,issuetype,reporter,labels,customfield_12307,customfield_12306"))
+            .and(query_param("expand", "changelog"))
             .and(basic_auth("bot@example.com", "token"))
             .respond_with(ResponseTemplate::new(200).set_body_json(svab_15_json()))
             .mount(&server)

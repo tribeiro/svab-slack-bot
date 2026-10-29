@@ -4,6 +4,7 @@
 //! posted about it, and returns the [`Action`]s to take; the actor carries them
 //! out. Keeping the logic pure makes it easy to unit test every case.
 
+use jiff::Timestamp;
 use serde::{Deserialize, Serialize};
 
 /// Status of an SVAB ticket. See the workflow in the SVAB Confluence page.
@@ -97,6 +98,9 @@ pub struct Issue {
     pub planned_deployment: Option<String>,
     /// "Change Contents" values, e.g. ["CSC software", "LOVE"].
     pub change_contents: Vec<String>,
+    /// When the ticket last moved into In Review (from the Jira changelog);
+    /// `None` if it never has.
+    pub entered_review_at: Option<Timestamp>,
     /// Link to the ticket in the Jira web UI.
     pub url: String,
 }
@@ -148,6 +152,7 @@ pub mod tests {
             labels: vec![],
             planned_deployment: Some("2026-10-27".into()),
             change_contents: vec!["CSC software".into()],
+            entered_review_at: Some("2026-10-26T15:59:31.727Z".parse().unwrap()),
             url: "https://rubinobs.atlassian.net/browse/SVAB-15".into(),
         }
     }
