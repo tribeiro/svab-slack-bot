@@ -93,13 +93,9 @@ mod tests {
         let text = announcement(&example_issue(), &mentions());
         assert_eq!(
             text,
-            ":large_yellow_circle: *CONSULTATION* <!subteam^SAPPROVERS> (attn <!subteam^SMAIN>) \
-             SVAB request ready for review\n\
-             <https://rubinobs.atlassian.net/browse/SVAB-15|SVAB-15>: Update ATBuilding and ATPneumatics\n\
-             - Type: Software Update\n\
-             - Requester: amanda.ibsen\n\
-             All board members must approve. Discussion should happen in this thread. \
-             Approvals must happen directly in the ticket."
+            ":large_yellow_circle: *CONSULTATION*\n\n\
+             <https://rubinobs.atlassian.net/browse/SVAB-15|SVAB-15>: Update ATBuilding and ATPneumatics\n\n\
+             <!subteam^SAPPROVERS> (attn <!subteam^SMAIN>) SVAB request ready for review (:thread:)"
         );
     }
 
@@ -127,11 +123,13 @@ mod tests {
         assert_eq!(
             details(&example_issue()),
             "Details for SVAB-15\n\
+             - Type: Software Update\n\
+             - Requester: amanda.ibsen\n\
              - Planned deployment: 2026-10-27\n\
              - Change contents: CSC software\n\
-             - BTS testing: tested\n\
-             Full description and test report: \
-             <https://rubinobs.atlassian.net/browse/SVAB-15|SVAB-15>"
+             - BTS testing: tested\n\n\
+             All board members must approve. Discussion should happen in this thread. \
+             Approvals must happen directly in the ticket."
         );
     }
 
