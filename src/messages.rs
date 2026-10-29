@@ -16,19 +16,18 @@ pub struct Mentions {
 /// The main post announcing a request that is ready for review.
 pub fn announcement(issue: &Issue, mentions: &Mentions) -> String {
     let (emoji, level) = match issue.level {
-        Some(Level::Consultation) => (":large_yellow_circle:", "CONSULTATION"),
+        Some(Level::Consultation) => (":large_blue_circle:", "CONSULTATION"),
         Some(Level::Critical) => (":red_circle:", "CRITICAL"),
         None => (":white_circle:", "UNKNOWN LEVEL"),
     };
     format!(
-        "{emoji} *{level}*\n\n\
-        <{url}|{key}>: {summary}\n\n\
-        <!subteam^{approvers}> (attn <!subteam^{main}>) SVAB request ready for review (:thread:)",
+        "{emoji} *{level}*: <!subteam^{approvers}> (attn <!subteam^{main}>) SVAB request ready for review (:thread:).\n\n\
+        <{url}|{key}>: {summary}",
+        approvers = mentions.approvers_group_id,
+        main = mentions.main_group_id,
         url = issue.url,
         key = issue.key,
         summary = escape(&issue.summary),
-        approvers = mentions.approvers_group_id,
-        main = mentions.main_group_id,
     )
 }
 
@@ -93,9 +92,8 @@ mod tests {
         let text = announcement(&example_issue(), &mentions());
         assert_eq!(
             text,
-            ":large_yellow_circle: *CONSULTATION*\n\n\
-             <https://rubinobs.atlassian.net/browse/SVAB-15|SVAB-15>: Update ATBuilding and ATPneumatics\n\n\
-             <!subteam^SAPPROVERS> (attn <!subteam^SMAIN>) SVAB request ready for review (:thread:)"
+            ":large_blue_circle: *CONSULTATION*: <!subteam^SAPPROVERS> (attn <!subteam^SMAIN>) SVAB request ready for review (:thread:).\n\n\
+             <https://rubinobs.atlassian.net/browse/SVAB-15|SVAB-15>: Update ATBuilding and ATPneumatics"
         );
     }
 
