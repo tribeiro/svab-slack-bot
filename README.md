@@ -4,15 +4,17 @@ Posts [SVAB](https://rubinobs.atlassian.net/wiki/x/HQBqSg) ticket updates to
 Slack (`#recap-software`). Unlike the Jira Slack plugin, it can put details and
 follow-up updates in a thread under the original announcement.
 
-> Status: milestone 2. When a ticket moves to **In Review**, the bot posts the
-> review request to the channel and the key details in its thread. Updates for
-> later statuses and catch-up after downtime are coming next.
+> Status: milestone 3. When a ticket moves to **In Review**, the bot posts the
+> review request to the channel and the key details in its thread. A
+> reconciler catches up on events missed while the bot was down. Thread
+> updates for later statuses are coming next.
 
 ## Architecture
 
 ```
 Jira Automation ──POST /jira/webhook──▶ server.rs   (auth, validate, forward)
                                              │  Command::IssueChanged { key, reply }
+reconciler.rs (startup + every 15 min) ──────┤  same command, per recently updated ticket
                                              ▼  tokio mpsc channel
                                         actor.rs    (one command at a time)
                                              │
@@ -32,6 +34,11 @@ Jira Automation ──POST /jira/webhook──▶ server.rs   (auth, validate, f
   order, one at a time, so events for the same ticket can't race and no locks
   are needed. For each ticket it fetches the facts from Jira, asks
   `svab::decide` what to do, and carries out the resulting actions.
+- **`reconciler.rs`**: Jira Automation doesn't retry failed web requests, so
+  the reconciler runs a pass at startup and then on an interval. Each pass
+  searches Jira for recently updated SVAB tickets and sends each one to the
+  actor, the same way the webhook does. `decide()` ignores tickets with
+  nothing new, so the reconciler itself has no catch-up logic.
 - **`svab.rs`**: domain types (`Issue`, `Status`, `Level`, `ThreadState`,
   `Action`) and `decide()`. There's no I/O here, so every case is a simple unit test.
 - **`messages.rs`**: the text of each Slack message (Slack mrkdwn).
@@ -79,6 +86,9 @@ post anything that isn't true.
 | `SVAB_BOT_SLACK_CHANNEL_ID` | yes | | Channel to post in (`C…`) |
 | `SVAB_BOT_SLACK_APPROVERS_GROUP_ID` | yes | | User group ID of `@svab-approvers` (`S…`) |
 | `SVAB_BOT_SLACK_MAIN_GROUP_ID` | yes | | User group ID of `@svab-main` (`S…`) |
+| `SVAB_BOT_ANNOUNCE_SINCE` | no (set it in production) | unset | Cutover time (RFC 3339, e.g. `2026-11-03T15:00:00Z`); see [Cutover](#cutover-from-the-jira-plugin) |
+| `SVAB_BOT_RECONCILE_INTERVAL_MINUTES` | no | `15` | Time between reconcile passes |
+| `SVAB_BOT_RECONCILE_LOOKBACK_HOURS` | no | `72` | Tickets updated within this window are checked; must cover the interval |
 | `SVAB_BOT_BIND_ADDR` | no | `0.0.0.0:8080` | HTTP listen address |
 | `SVAB_BOT_JIRA_PROJECT` | no | `SVAB` | Only issue keys from this project are accepted |
 | `RUST_LOG` | no | `info` | Log level/filter, e.g. `svab_slack_bot=debug` |
@@ -122,6 +132,30 @@ curl -s -o /dev/null -w '%{http_code}\n' -u "$SVAB_BOT_JIRA_EMAIL:$SVAB_BOT_JIRA
 - **401 here, but 200 via `https://api.atlassian.com/ex/jira/<cloud-id>`**:
   the token is scoped. Set `SVAB_BOT_JIRA_API_URL` to that gateway URL.
 
+## Cutover from the Jira plugin
+
+Tickets the old plugin announced have no stored thread, so without a guard
+the bot would announce them again. To prevent that, `decide()` compares
+**when the ticket last entered In Review** (from the Jira changelog) with
+`SVAB_BOT_ANNOUNCE_SINCE`. For a ticket the bot has never posted about:
+
+| Ticket | Result |
+|---|---|
+| Entered In Review before the cutover | Nothing; the plugin announced it |
+| In Review, entered after the cutover | Announced |
+| Past In Review, entered after the cutover, never announced | Warning in the logs, no late post |
+| Never been In Review | Nothing |
+
+Procedure:
+1. Deploy the bot pointed at `#recap-software`, with
+   `SVAB_BOT_ANNOUNCE_SINCE` set to the time you'll disable the plugin
+   (a few minutes ahead is fine).
+2. Disable the plugin's SVAB rule and enable the bot's Jira Automation rule.
+3. Check the logs for `reconcile pass done` with `failed=0`.
+
+A ticket reworked after the cutover and resubmitted counts from its new
+entry into In Review, so it is announced by the bot.
+
 ## Running locally
 
 Point `SVAB_BOT_SLACK_CHANNEL_ID` at a **test channel**.
@@ -142,7 +176,10 @@ curl -i -X POST localhost:8080/jira/webhook \
 ```
 
 The bot only announces tickets that are **In Review** and have no stored thread
-yet. To announce the same ticket again, delete the property:
+yet. The reconciler's startup pass will also pick up any such ticket updated in
+the last 72 hours, so set `SVAB_BOT_ANNOUNCE_SINCE` to now if you don't want
+real In Review tickets announced in your test channel. To announce the same
+ticket again, delete the property:
 
 ```sh
 curl -u "$SVAB_BOT_JIRA_EMAIL:$SVAB_BOT_JIRA_API_TOKEN" -X DELETE \
