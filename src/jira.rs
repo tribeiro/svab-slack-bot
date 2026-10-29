@@ -1,5 +1,6 @@
-//! Minimal Jira Cloud REST client: check our access, read an issue, and
-//! read/write the issue property where the bot keeps its [`ThreadState`].
+//! Minimal Jira Cloud REST client: check our access, read an issue, find
+//! recently updated issues, and read/write the issue property where the bot
+//! keeps its [`ThreadState`].
 //!
 //! Jira's JSON is mapped into private `Raw*` structs that mirror the API, then
 //! converted into the domain [`Issue`]. Only this module knows Jira's shapes.
@@ -10,7 +11,7 @@ use std::time::Duration;
 use anyhow::{Context, bail};
 use jiff::Timestamp;
 use reqwest::{Response, StatusCode};
-use serde::Deserialize;
+use serde::{Deserialize, Serialize};
 
 use crate::config::JiraConfig;
 use crate::svab::{Issue, Level, Status, ThreadState};
@@ -25,6 +26,11 @@ const FIELD_CHANGE_CONTENTS: &str = "customfield_12306";
 /// Project permissions the bot needs: see issues, and set issue properties
 /// (which Jira counts as editing the issue).
 const REQUIRED_PERMISSIONS: [&str; 2] = ["BROWSE_PROJECTS", "EDIT_ISSUES"];
+
+/// Results per search page (Jira's maximum is 100 when few fields are asked).
+const SEARCH_PAGE_SIZE: u32 = 100;
+/// Stop paginating after this many pages, in case Jira keeps returning tokens.
+const MAX_SEARCH_PAGES: usize = 20;
 
 /// Don't let a slow Jira block the actor forever.
 const TIMEOUT: Duration = Duration::from_secs(15);
@@ -93,6 +99,52 @@ impl JiraClient {
             );
         }
         Ok(me.display_name)
+    }
+
+    /// Keys of the issues in `project` updated within the last
+    /// `lookback_hours`, oldest update first.
+    pub async fn search_recently_updated(
+        &self,
+        project: &str,
+        lookback_hours: u32,
+    ) -> anyhow::Result<Vec<String>> {
+        // A relative date ("-72h") avoids any time zone ambiguity in JQL.
+        let jql = format!(
+            "project = \"{project}\" AND updated >= \"-{lookback_hours}h\" ORDER BY updated ASC"
+        );
+        let url = format!("{}/rest/api/3/search/jql", self.config.api_url);
+
+        let mut keys = Vec::new();
+        let mut next_page_token: Option<String> = None;
+        for _ in 0..MAX_SEARCH_PAGES {
+            let request = SearchRequest {
+                jql: &jql,
+                // Only the key is needed; ask for one cheap field.
+                fields: &["status"],
+                max_results: SEARCH_PAGE_SIZE,
+                next_page_token: next_page_token.as_deref(),
+            };
+            let response = self
+                .http
+                .post(&url)
+                .basic_auth(&self.config.email, Some(&self.config.api_token))
+                .json(&request)
+                .send()
+                .await;
+            let page: RawSearchPage = check_status(response)
+                .await
+                .context("searching recently updated issues")?
+                .json()
+                .await
+                .context("parsing search results")?;
+
+            keys.extend(page.issues.into_iter().map(|issue| issue.key));
+            match page.next_page_token {
+                Some(token) if !page.is_last => next_page_token = Some(token),
+                _ => return Ok(keys),
+            }
+        }
+        bail!("search returned more than {MAX_SEARCH_PAGES} pages; is the lookback too long?")
     }
 
     /// Fetch an issue and convert it to the domain type.
@@ -204,6 +256,30 @@ async fn check_status(response: reqwest::Result<Response>) -> anyhow::Result<Res
 }
 
 // --- Jira JSON shapes (only the fields we use) ---
+
+#[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
+struct SearchRequest<'a> {
+    jql: &'a str,
+    fields: &'a [&'a str],
+    max_results: u32,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    next_page_token: Option<&'a str>,
+}
+
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct RawSearchPage {
+    issues: Vec<RawSearchHit>,
+    next_page_token: Option<String>,
+    #[serde(default)]
+    is_last: bool,
+}
+
+#[derive(Deserialize)]
+struct RawSearchHit {
+    key: String,
+}
 
 /// Error body Jira sends with most 4xx responses.
 #[derive(Deserialize)]
@@ -342,7 +418,7 @@ impl RawChangelog {
 pub mod tests {
     use super::*;
     use serde_json::json;
-    use wiremock::matchers::{basic_auth, body_json, method, path, query_param};
+    use wiremock::matchers::{basic_auth, body_json, body_partial_json, method, path, query_param};
     use wiremock::{Mock, MockServer, ResponseTemplate};
 
     use crate::svab::tests::example_issue;
@@ -484,6 +560,60 @@ pub mod tests {
             .await
             .unwrap_err();
         assert!(format!("{err:#}").contains("Jira rejected the credentials"));
+    }
+
+    #[tokio::test]
+    async fn search_follows_pagination() {
+        let server = MockServer::start().await;
+        let jql = "project = \"SVAB\" AND updated >= \"-72h\" ORDER BY updated ASC";
+        // Mounted first so it wins for the second request, which carries the token.
+        Mock::given(method("POST"))
+            .and(path("/rest/api/3/search/jql"))
+            .and(body_partial_json(
+                json!({"jql": jql, "nextPageToken": "page-2"}),
+            ))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+                "issues": [{"id": "3", "key": "SVAB-3"}],
+                "isLast": true
+            })))
+            .expect(1)
+            .mount(&server)
+            .await;
+        Mock::given(method("POST"))
+            .and(path("/rest/api/3/search/jql"))
+            .and(body_partial_json(json!({"jql": jql, "maxResults": 100})))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+                "issues": [{"id": "1", "key": "SVAB-1"}, {"id": "2", "key": "SVAB-2"}],
+                "nextPageToken": "page-2",
+                "isLast": false
+            })))
+            .expect(1)
+            .mount(&server)
+            .await;
+
+        let keys = client(&server)
+            .await
+            .search_recently_updated("SVAB", 72)
+            .await
+            .unwrap();
+        assert_eq!(keys, ["SVAB-1", "SVAB-2", "SVAB-3"]);
+    }
+
+    #[tokio::test]
+    async fn search_with_no_results() {
+        let server = MockServer::start().await;
+        Mock::given(path("/rest/api/3/search/jql"))
+            .respond_with(
+                ResponseTemplate::new(200).set_body_json(json!({"issues": [], "isLast": true})),
+            )
+            .mount(&server)
+            .await;
+
+        let keys = client(&server)
+            .await
+            .search_recently_updated("SVAB", 72)
+            .await;
+        assert!(keys.unwrap().is_empty());
     }
 
     #[tokio::test]
