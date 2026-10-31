@@ -14,8 +14,9 @@
 //! resulting [`Action`]s.
 
 use anyhow::Context;
+use jiff::Timestamp;
 use tokio::sync::{mpsc, oneshot};
-use tracing::{debug, error, info};
+use tracing::{debug, error, info, warn};
 
 use crate::config::SlackConfig;
 use crate::jira::JiraClient;
@@ -42,6 +43,7 @@ pub struct SvabActor {
     slack: SlackClient,
     channel_id: String,
     mentions: Mentions,
+    announce_since: Option<Timestamp>,
 }
 
 impl SvabActor {
@@ -50,11 +52,13 @@ impl SvabActor {
         jira: JiraClient,
         slack: SlackClient,
         slack_config: &SlackConfig,
+        announce_since: Option<Timestamp>,
     ) -> Self {
         Self {
             rx,
             jira,
             slack,
+            announce_since,
             channel_id: slack_config.channel_id.clone(),
             mentions: Mentions {
                 approvers_group_id: slack_config.approvers_group_id.clone(),
@@ -86,12 +90,18 @@ impl SvabActor {
         let issue = self.jira.get_issue(key).await?;
         let thread = self.jira.get_thread_state(key).await?;
 
-        let actions = svab::decide(&issue, thread.as_ref());
+        let actions = svab::decide(&issue, thread.as_ref(), self.announce_since);
         debug!(%key, status = issue.status.name(), ?actions, "decided");
 
         for action in actions {
             match action {
                 Action::Announce => self.announce(&issue).await?,
+                Action::WarnNeverAnnounced => warn!(
+                    %key,
+                    status = issue.status.name(),
+                    "ticket went through review without being announced \
+                     (bot down at the time?); not announcing it late"
+                ),
             }
         }
         Ok(())
@@ -156,7 +166,7 @@ mod tests {
             approvers_group_id: "S111".into(),
             main_group_id: "S222".into(),
         };
-        SvabActor::new(rx, jira, slack, &slack_config)
+        SvabActor::new(rx, jira, slack, &slack_config, None)
     }
 
     async fn send(tx: &mpsc::Sender<Command>, key: &str) -> oneshot::Receiver<anyhow::Result<()>> {

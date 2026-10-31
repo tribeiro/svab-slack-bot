@@ -3,12 +3,14 @@
 //! See README.md for the architecture. In short:
 //! `server` (HTTP) --Command--> `actor` (does the work, one command at a time),
 //! which uses `jira` and `slack` clients, `svab::decide` and `messages`.
+//! `reconciler` periodically sends the same commands to catch up on missed events.
 
 mod actor;
 mod config;
 mod error;
 mod jira;
 mod messages;
+mod reconciler;
 mod server;
 mod slack;
 mod svab;
@@ -16,12 +18,13 @@ mod svab;
 use anyhow::{Context, bail};
 use tokio::net::TcpListener;
 use tokio::sync::mpsc;
-use tracing::info;
+use tracing::{info, warn};
 use tracing_subscriber::EnvFilter;
 
 use crate::actor::SvabActor;
 use crate::config::Config;
 use crate::jira::JiraClient;
+use crate::reconciler::Reconciler;
 use crate::server::AppState;
 use crate::slack::SlackClient;
 
@@ -50,8 +53,23 @@ async fn main() -> anyhow::Result<()> {
         .await
         .context("Slack startup check failed")?;
     info!(account = %slack_account, "Slack access OK");
-    let actor = SvabActor::new(rx, jira, slack, &config.slack);
+    if config.announce_since.is_none() {
+        warn!(
+            "SVAB_BOT_ANNOUNCE_SINCE is not set: tickets already announced by the \
+             old Jira plugin may be announced again"
+        );
+    }
+    // The reconciler sends the same commands as the webhook, through its own
+    // clone of the sender. JiraClient is cheap to clone (shared connection pool).
+    let reconciler = Reconciler::new(
+        jira.clone(),
+        tx.clone(),
+        &config.jira_project,
+        config.reconcile.clone(),
+    );
+    let actor = SvabActor::new(rx, jira, slack, &config.slack, config.announce_since);
     let mut actor_task = tokio::spawn(actor.run());
+    let mut reconciler_task = tokio::spawn(reconciler.run());
 
     let app = server::router(AppState::new(tx, &config));
     let listener = TcpListener::bind(config.bind_addr)
@@ -61,11 +79,14 @@ async fn main() -> anyhow::Result<()> {
 
     let server = axum::serve(listener, app).with_graceful_shutdown(shutdown_signal());
 
-    // Run until the server shuts down. If the actor dies (e.g. it panicked),
-    // the bot can't do anything useful, so exit and let Kubernetes restart it.
+    // Run until the server shuts down. If the actor or the reconciler dies
+    // (e.g. it panicked), exit and let Kubernetes restart the bot: without the
+    // actor nothing works, and without the reconciler missed events would go
+    // unnoticed.
     tokio::select! {
         result = server => result.context("HTTP server failed")?,
         result = &mut actor_task => bail!("actor task exited unexpectedly: {result:?}"),
+        result = &mut reconciler_task => bail!("reconciler task exited unexpectedly: {result:?}"),
     }
 
     info!("shut down cleanly");

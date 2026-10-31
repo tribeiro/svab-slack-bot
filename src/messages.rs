@@ -16,19 +16,18 @@ pub struct Mentions {
 /// The main post announcing a request that is ready for review.
 pub fn announcement(issue: &Issue, mentions: &Mentions) -> String {
     let (emoji, level) = match issue.level {
-        Some(Level::Consultation) => (":large_yellow_circle:", "CONSULTATION"),
+        Some(Level::Consultation) => (":large_blue_circle:", "CONSULTATION"),
         Some(Level::Critical) => (":red_circle:", "CRITICAL"),
         None => (":white_circle:", "UNKNOWN LEVEL"),
     };
     format!(
-        "{emoji} *{level}*\n\n\
-        <{url}|{key}>: {summary}\n\n\
-        <!subteam^{approvers}> (attn <!subteam^{main}>) SVAB request ready for review (:thread:)",
+        "{emoji} *{level}*: <!subteam^{approvers}> (attn <!subteam^{main}>) SVAB request ready for review (:thread:).\n\n\
+        <{url}|{key}>: {summary}",
+        approvers = mentions.approvers_group_id,
+        main = mentions.main_group_id,
         url = issue.url,
         key = issue.key,
         summary = escape(&issue.summary),
-        approvers = mentions.approvers_group_id,
-        main = mentions.main_group_id,
     )
 }
 
@@ -93,13 +92,8 @@ mod tests {
         let text = announcement(&example_issue(), &mentions());
         assert_eq!(
             text,
-            ":large_yellow_circle: *CONSULTATION* <!subteam^SAPPROVERS> (attn <!subteam^SMAIN>) \
-             SVAB request ready for review\n\
-             <https://rubinobs.atlassian.net/browse/SVAB-15|SVAB-15>: Update ATBuilding and ATPneumatics\n\
-             - Type: Software Update\n\
-             - Requester: amanda.ibsen\n\
-             All board members must approve. Discussion should happen in this thread. \
-             Approvals must happen directly in the ticket."
+            ":large_blue_circle: *CONSULTATION*: <!subteam^SAPPROVERS> (attn <!subteam^SMAIN>) SVAB request ready for review (:thread:).\n\n\
+             <https://rubinobs.atlassian.net/browse/SVAB-15|SVAB-15>: Update ATBuilding and ATPneumatics"
         );
     }
 
@@ -127,11 +121,13 @@ mod tests {
         assert_eq!(
             details(&example_issue()),
             "Details for SVAB-15\n\
+             - Type: Software Update\n\
+             - Requester: amanda.ibsen\n\
              - Planned deployment: 2026-10-27\n\
              - Change contents: CSC software\n\
-             - BTS testing: tested\n\
-             Full description and test report: \
-             <https://rubinobs.atlassian.net/browse/SVAB-15|SVAB-15>"
+             - BTS testing: tested\n\n\
+             All board members must approve. Discussion should happen in this thread. \
+             Approvals must happen directly in the ticket."
         );
     }
 
