@@ -4,7 +4,7 @@
 //! a user group, `*bold*`, and emoji are written as `:name:`. Characters `&`,
 //! `<` and `>` in user-provided text must be escaped (see [`escape`]).
 
-use crate::svab::{Issue, Level};
+use crate::svab::{Issue, Level, Status};
 
 /// Slack user groups mentioned in the announcement.
 #[derive(Debug, Clone)]
@@ -57,6 +57,16 @@ pub fn details(issue: &Issue) -> String {
     )
 }
 
+/// Generate message to update the issue status.
+pub fn update(issue: &Issue) -> String {
+    format!(
+        "{emoji} {key} is now *{status}*.",
+        emoji = status_emoji(&issue.status),
+        key = issue.key,
+        status = escape(issue.status.name()),
+    )
+}
+
 /// Describe BTS testing based on the `bts-pending` / `bts-exempt` labels.
 fn bts_status(labels: &[String]) -> &'static str {
     if labels.iter().any(|l| l == "bts-pending") {
@@ -65,6 +75,19 @@ fn bts_status(labels: &[String]) -> &'static str {
         ":warning: exemption requested (`bts-exempt`): see justification in the ticket"
     } else {
         "tested"
+    }
+}
+
+/// Emoji representation for each status to display on messages.
+fn status_emoji(status: &Status) -> &'static str {
+    match status {
+        Status::Approved => ":white_check_mark:",
+        Status::Done => ":rocket:",
+        Status::RolledBack => ":rewind:",
+        Status::Cancelled => ":no_entry_sign:",
+        Status::InProgress => ":construction:",
+        Status::InReview => ":eyes:",
+        Status::Open | Status::Tested | Status::Other(_) => ":information_source:",
     }
 }
 
@@ -143,5 +166,12 @@ mod tests {
         assert!(text.contains("BTS testing: :warning: pending (`bts-pending`)"));
         assert!(text.contains("Planned deployment: not set"));
         assert!(text.contains("Change contents: not set"));
+    }
+
+    #[test]
+    fn update_text() {
+        let issue = example_issue();
+        let text = update(&issue);
+        assert_eq!(text, ":eyes: SVAB-15 is now *In Review*.");
     }
 }
