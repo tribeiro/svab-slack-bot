@@ -137,6 +137,28 @@ impl SvabActor {
             .context("posting details in the thread")?;
         Ok(())
     }
+
+    async fn update_in_thread(&self, issue: &Issue, thread: &ThreadState) -> anyhow::Result<()> {
+        let text = messages::update(issue);
+
+        self.slack
+            .post_message(&thread.channel, &text, Some(&thread.thread_ts))
+            .await
+            .context("posting status update in the thread")?;
+
+        let state = ThreadState {
+            channel: thread.channel.clone(),
+            thread_ts: thread.thread_ts.clone(),
+            last_status: issue.status.clone(),
+        };
+
+        self.jira
+            .set_thread_state(&issue.key, &state)
+            .await
+            .context("status update posted but saving last_status failed")?;
+
+        Ok(())
+    }
 }
 
 #[cfg(test)]
@@ -145,7 +167,7 @@ mod tests {
     use crate::config::JiraConfig;
     use crate::jira::tests::svab_15_json;
     use serde_json::json;
-    use wiremock::matchers::{method, path};
+    use wiremock::matchers::{body_json, body_partial_json, method, path};
     use wiremock::{Mock, MockServer, ResponseTemplate};
 
     const PROPERTY_PATH: &str = "/rest/api/3/issue/SVAB-15/properties/svab-slack-bot";
@@ -269,5 +291,62 @@ mod tests {
         tokio::spawn(actor(&server, rx).run());
 
         assert!(send(&tx, "SVAB-15").await.await.unwrap().is_err());
+    }
+
+    #[tokio::test]
+    async fn posts_status_updates_in_existing_threads() {
+        let server = MockServer::start().await;
+
+        // Set the ticket status as approved
+        let mut issue = svab_15_json();
+        issue["fields"]["status"]["name"] = json!("SVAB Approved");
+
+        Mock::given(method("GET"))
+            .and(path("/rest/api/3/issue/SVAB-15"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(issue))
+            .mount(&server)
+            .await;
+
+        // ...but the last thing we posted was In Review, in a thread that
+        // lives in C_OLD, not the configured channel (C123).
+        Mock::given(method("GET"))
+            .and(path(PROPERTY_PATH))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+                "key": "svab-slack-bot",
+                "value": {"channel": "C_OLD", "thread_ts": "111.000", "last_status": "In Review"}
+            })))
+            .mount(&server)
+            .await;
+
+        // Exactly one reply, in the existing thread and its channel.
+        Mock::given(method("POST"))
+            .and(path("/chat.postMessage"))
+            .and(body_partial_json(
+                json!({"channel": "C_OLD", "thread_ts": "111.000"}),
+            ))
+            .respond_with(
+                ResponseTemplate::new(200).set_body_json(json!({"ok": true, "ts": "222.000"})),
+            )
+            .expect(1)
+            .mount(&server)
+            .await;
+
+        // The new status is saved, and the thread stays where it was.
+        Mock::given(method("PUT"))
+            .and(path(PROPERTY_PATH))
+            .and(body_json(json!({
+                "channel": "C_OLD",
+                "thread_ts": "111.000",
+                "last_status": "SVAB Approved"
+            })))
+            .respond_with(ResponseTemplate::new(200))
+            .expect(1)
+            .mount(&server)
+            .await;
+
+        let (tx, rx) = mpsc::channel(QUEUE_CAPACITY);
+        tokio::spawn(actor(&server, rx).run());
+
+        send(&tx, "SVAB-15").await.await.unwrap().unwrap();
     }
 }
