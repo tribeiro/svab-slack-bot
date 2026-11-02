@@ -96,6 +96,7 @@ impl SvabActor {
         for action in actions {
             match action {
                 Action::Announce => self.announce(&issue).await?,
+                Action::UpdateInThread(thread) => self.update_in_thread(&issue, &thread).await?,
                 Action::WarnNeverAnnounced => warn!(
                     %key,
                     status = issue.status.name(),
