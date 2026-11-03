@@ -1,0 +1,35 @@
+# Runs on every pull request and on pushes to main: formatting, lints and
+# tests must pass before anything is merged.
+name: CI
+
+on:
+  pull_request:
+  push:
+    branches: [main]
+
+# The default token can only read the repo; jobs ask for more if they need it.
+permissions:
+  contents: read
+
+# A new push to a pull request cancels its previous, now-outdated run.
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
+jobs:
+  checks:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+
+      # Installs the version pinned in rust-toolchain.toml (with rustfmt
+      # and clippy).
+      - run: rustup toolchain install
+
+      # Caches ~/.cargo and target/ between runs, keyed on Cargo.lock.
+      - uses: Swatinem/rust-cache@v2
+
+      - run: cargo fmt --check
+      # --locked: fail if Cargo.lock is out of date instead of updating it.
+      - run: cargo clippy --all-targets --locked -- -D warnings
+      - run: cargo test --locked
