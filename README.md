@@ -8,7 +8,8 @@ follow-up updates in a thread under the original announcement.
 > review request to the channel and the key details in its thread. Every
 > later status change (approved, done, rolled back, rework, …) is posted as a
 > reply in that thread. A reconciler catches up on events missed while the
-> bot was down.
+> bot was down. CI checks every PR and publishes the Docker image to ghcr.io
+> (milestone 5a); deployment via Phalanx comes next.
 
 ## Architecture
 
@@ -240,3 +241,39 @@ docker build -t svab-slack-bot .
 Tests for `jira.rs`, `slack.rs` and `actor.rs` run against
 [wiremock](https://docs.rs/wiremock) fake servers, so they need no network
 access or credentials.
+
+The Rust version is pinned in `rust-toolchain.toml`; `rustup` picks it up
+automatically. To upgrade Rust, bump it there **and** the `rust:` image tag in
+the `Dockerfile` in the same PR.
+
+### CI
+
+`.github/workflows/ci.yaml` runs on every pull request and push to `main`:
+
+1. **checks**: the three `cargo` commands above (with `--locked`, so an
+   out-of-date `Cargo.lock` fails).
+2. **image**: if the checks pass, builds the Docker image. Pull requests only
+   build it; `main` and version tags also push it to
+   `ghcr.io/tribeiro/svab-slack-bot`.
+
+| Trigger | Image tags |
+|---|---|
+| Pull request #12 | none (built, not pushed) |
+| Push to `main` | `main`, `sha-<commit>` |
+| Tag `v1.2.0` | `1.2.0`, `sha-<commit>` |
+
+Dependabot opens weekly PRs for Cargo crates and GitHub Actions
+(`.github/dependabot.yml`).
+
+### Releasing
+
+Deploy version tags, not `main`, so you always know what's running:
+
+1. Bump `version` in `Cargo.toml` (and run `cargo check` to update
+   `Cargo.lock`), and merge that PR.
+2. Tag the merge commit and push the tag:
+   ```sh
+   git tag v0.2.0 && git push origin v0.2.0
+   ```
+3. CI publishes `ghcr.io/tribeiro/svab-slack-bot:0.2.0`; point the Phalanx
+   chart's `appVersion` (or image tag) at it.
