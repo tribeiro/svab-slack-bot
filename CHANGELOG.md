@@ -30,6 +30,7 @@ adding threads under each announcement.
 
 - Added a README covering the architecture, where state lives, how to add a notification, configuration, Slack and Jira permissions, startup checks, Jira auth troubleshooting, the cutover procedure, running locally and the Jira Automation rule.
 - Documented CI, the pinned toolchain, the changelog workflow and the release process.
+- Added `CLAUDE.md` with the architecture rules, conventions and settled design decisions.
 
 ### Other changes
 
