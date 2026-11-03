@@ -1,11 +1,13 @@
 # Runs on every pull request and on pushes to main: formatting, lints and
-# tests must pass before anything is merged.
+# tests must pass before anything is merged. If they do, the Docker image is
+# built; on main and on version tags (v1.2.3) it is also pushed to ghcr.io.
 name: CI
 
 on:
   pull_request:
   push:
     branches: [main]
+    tags: ["v*"]
 
 # The default token can only read the repo; jobs ask for more if they need it.
 permissions:
@@ -33,3 +35,46 @@ jobs:
       # --locked: fail if Cargo.lock is out of date instead of updating it.
       - run: cargo clippy --all-targets --locked -- -D warnings
       - run: cargo test --locked
+
+  image:
+    needs: checks
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      packages: write # push to ghcr.io with the workflow's own token
+    steps:
+      - uses: actions/checkout@v7
+
+      - uses: docker/setup-buildx-action@v4
+
+      # Work out the image tags from what triggered the run:
+      #   tag v1.2.3     -> 1.2.3 (what Phalanx should deploy)
+      #   push to main   -> main
+      #   pull request   -> pr-<n> (built only, never pushed)
+      #   every run      -> sha-<short commit>
+      - uses: docker/metadata-action@v6
+        id: meta
+        with:
+          images: ghcr.io/${{ github.repository }}
+          tags: |
+            type=semver,pattern={{version}}
+            type=ref,event=branch
+            type=ref,event=pr
+            type=sha
+
+      - uses: docker/login-action@v4
+        if: github.event_name != 'pull_request'
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - uses: docker/build-push-action@v7
+        with:
+          context: .
+          push: ${{ github.event_name != 'pull_request' }}
+          tags: ${{ steps.meta.outputs.tags }}
+          labels: ${{ steps.meta.outputs.labels }}
+          # Reuse layers (e.g. compiled dependencies) from earlier runs.
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
