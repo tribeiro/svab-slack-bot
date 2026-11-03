@@ -123,6 +123,8 @@ pub enum Action {
     /// Post the review request to the channel, save the thread, then post
     /// the details in the thread.
     Announce,
+    /// Post status update in the thread.
+    UpdateInThread(ThreadState),
     /// The ticket went through review after the cutover but was never
     /// announced (e.g. the bot was down the whole time). Don't post late;
     /// just log a warning.
@@ -137,9 +139,12 @@ pub fn decide(
     thread: Option<&ThreadState>,
     announce_since: Option<Timestamp>,
 ) -> Vec<Action> {
-    if thread.is_some() {
-        // Already announced. Thread updates for later statuses come in a
-        // later milestone.
+    if let Some(thread) = thread {
+        // Already announced: post status changes in the thread and ignore
+        // anything else.
+        if issue.status != thread.last_status {
+            return vec![Action::UpdateInThread(thread.clone())];
+        }
         return vec![];
     }
 
@@ -297,6 +302,27 @@ pub mod tests {
             assert_eq!(
                 decide(&issue, None, since),
                 vec![Action::WarnNeverAnnounced]
+            );
+        }
+    }
+
+    #[test]
+    fn post_status_updates_on_thread() {
+        let thread_state = thread(Status::Approved);
+
+        for status in [
+            Status::InReview,
+            Status::RolledBack,
+            Status::Cancelled,
+            Status::InProgress,
+        ] {
+            let issue = Issue {
+                status,
+                ..example_issue()
+            };
+            assert_eq!(
+                decide(&issue, Some(&thread_state), None),
+                vec![Action::UpdateInThread(thread_state.clone()),]
             );
         }
     }
