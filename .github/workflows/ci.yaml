@@ -36,6 +36,21 @@ jobs:
       - run: cargo clippy --all-targets --locked -- -D warnings
       - run: cargo test --locked
 
+  # Every PR must add a news fragment to changelog.d/ (see towncrier.toml).
+  # Release PRs pass too, because they change CHANGELOG.md. Dependabot PRs
+  # are skipped: dependency bumps don't need a changelog entry.
+  changelog:
+    if: >-
+      github.event_name == 'pull_request' &&
+      github.event.pull_request.user.login != 'dependabot[bot]'
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          fetch-depth: 0 # towncrier compares against the base branch
+      - uses: astral-sh/setup-uv@v10.3.3 # no floating major tag upstream; Dependabot bumps it
+      - run: uvx towncrier@26.9.0 check --compare-with origin/${{ github.base_ref }}
+
   image:
     needs: checks
     runs-on: ubuntu-latest
