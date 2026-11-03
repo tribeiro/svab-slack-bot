@@ -1,0 +1,6 @@
+# Pin the Rust version so local builds, CI and the Docker image all use the
+# same compiler (and the same clippy lints). To upgrade, bump `channel` here
+# and the `rust:` image tag in the Dockerfile together.
+[toolchain]
+channel = "1.98"
+components = ["rustfmt", "clippy"]
