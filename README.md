@@ -4,10 +4,11 @@ Posts [SVAB](https://rubinobs.atlassian.net/wiki/x/HQBqSg) ticket updates to
 Slack (`#recap-software`). Unlike the Jira Slack plugin, it can put details and
 follow-up updates in a thread under the original announcement.
 
-> Status: milestone 3. When a ticket moves to **In Review**, the bot posts the
-> review request to the channel and the key details in its thread. A
-> reconciler catches up on events missed while the bot was down. Thread
-> updates for later statuses are coming next.
+> Status: milestone 4. When a ticket moves to **In Review**, the bot posts the
+> review request to the channel and the key details in its thread. Every
+> later status change (approved, done, rolled back, rework, …) is posted as a
+> reply in that thread. A reconciler catches up on events missed while the
+> bot was down.
 
 ## Architecture
 
@@ -51,8 +52,31 @@ reconciler.rs (startup + every 15 min) ──────┤  same command, per 
 The bot process keeps no state. For each announced ticket it stores the Slack
 channel, the thread timestamp and the last status it posted about in a Jira
 **issue property** (`svab-slack-bot`) on the ticket itself. Restarts lose
-nothing, and handling is idempotent: an event for a ticket that is already
-announced posts nothing.
+nothing, and handling is idempotent:
+
+- No stored thread and the ticket is In Review → announce it (subject to the
+  [cutover guard](#cutover-from-the-jira-plugin)).
+- Stored thread and the status differs from `last_status` → post the new
+  status in the thread, then save it as `last_status`.
+- Stored thread and the status equals `last_status` → nothing. Replayed
+  webhooks and reconciler passes post nothing new.
+
+Updates always go to the channel and thread stored in the property, not the
+currently configured channel, so changing `SVAB_BOT_SLACK_CHANNEL_ID` (e.g.
+after a trial in a test channel) doesn't break threads that already exist.
+
+If several transitions happen while the bot is down (e.g. In Review → SVAB
+Approved → Done), the reconciler only sees the current status and posts one
+reply for it.
+
+### Thread replies only
+
+Status updates are plain thread replies, never broadcast to the channel
+(`reply_broadcast`). This is deliberate: people mentioned in the
+announcement follow the thread and get notified of replies, and the channel
+stays free of follow-up noise. To make some updates (e.g. Rolled Back) also
+appear in the channel, add a `reply_broadcast` flag to
+`SlackClient::post_message` and decide it in `svab::decide`.
 
 The webhook body only says *which* ticket changed. The bot always reads the
 real state from the Jira API, so a forged or replayed request can't make it
@@ -71,7 +95,11 @@ post anything that isn't true.
 1. Add a variant to `Action` in `svab.rs` and return it from `decide()` for the
    right status/state combination. Add a unit test there.
 2. Add a function that builds the text in `messages.rs`.
-3. Handle the new action in `SvabActor::handle_issue` (`actor.rs`).
+3. Handle the new action in `SvabActor::handle_issue` (`actor.rs`), and add a
+   wiremock test for it there.
+
+To change the wording or emoji of a status update instead, edit `update()`
+and `status_emoji()` in `messages.rs`.
 
 ## Configuration
 
@@ -156,6 +184,10 @@ Procedure:
 A ticket reworked after the cutover and resubmitted counts from its new
 entry into In Review, so it is announced by the bot.
 
+Tickets the plugin announced get **no thread updates** from the bot: there
+is no stored thread to reply to. They keep the plugin's single message until
+they are closed (or resubmitted, as above).
+
 ## Running locally
 
 Point `SVAB_BOT_SLACK_CHANNEL_ID` at a **test channel**.
@@ -176,7 +208,8 @@ curl -i -X POST localhost:8080/jira/webhook \
 ```
 
 The bot only announces tickets that are **In Review** and have no stored thread
-yet. The reconciler's startup pass will also pick up any such ticket updated in
+yet; once announced, moving the ticket to another status posts a reply in the
+thread. The reconciler's startup pass will also pick up any such ticket updated in
 the last 72 hours, so set `SVAB_BOT_ANNOUNCE_SINCE` to now if you don't want
 real In Review tickets announced in your test channel. To announce the same
 ticket again, delete the property:
