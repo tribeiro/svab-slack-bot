@@ -252,7 +252,9 @@ the `Dockerfile` in the same PR.
 
 1. **checks**: the three `cargo` commands above (with `--locked`, so an
    out-of-date `Cargo.lock` fails).
-2. **image**: if the checks pass, builds the Docker image. Pull requests only
+2. **changelog** (pull requests only): fails if the PR adds no news fragment
+   to `changelog.d/`. See [Changelog](#changelog).
+3. **image**: if the checks pass, builds the Docker image. Pull requests only
    build it; `main` and version tags also push it to
    `ghcr.io/tribeiro/svab-slack-bot`.
 
@@ -265,12 +267,38 @@ the `Dockerfile` in the same PR.
 Dependabot opens weekly PRs for Cargo crates and GitHub Actions
 (`.github/dependabot.yml`).
 
+### Changelog
+
+`CHANGELOG.md` is built by [towncrier](https://towncrier.readthedocs.io)
+from small news fragments, so PRs never conflict on it. Every PR adds at
+least one fragment to `changelog.d/`, named `<ticket>.<type>.md`, written in
+the past tense:
+
+```sh
+uvx towncrier create OSW-1234.feature.md -c "Added thread replies for status changes."
+```
+
+| Type | Use for |
+|---|---|
+| `feature` | New behaviour |
+| `bugfix` | Fixes |
+| `doc` | Documentation only |
+| `misc` | Anything else (CI, refactoring, dependencies) |
+
+A change without a Jira ticket uses an orphan fragment, which gets no
+ticket link: `+short-name.misc.md`. The configuration is in `towncrier.toml`.
+
 ### Releasing
 
 Deploy version tags, not `main`, so you always know what's running:
 
-1. Bump `version` in `Cargo.toml` (and run `cargo check` to update
-   `Cargo.lock`), and merge that PR.
+1. In a release PR, bump `version` in `Cargo.toml` (run `cargo check` to
+   update `Cargo.lock`) and collect the news fragments into the changelog:
+   ```sh
+   uvx towncrier build --version 0.2.0 --yes
+   ```
+   This writes the new section to `CHANGELOG.md` and deletes the fragments.
+   Merge the PR.
 2. Tag the merge commit and push the tag:
    ```sh
    git tag v0.2.0 && git push origin v0.2.0
