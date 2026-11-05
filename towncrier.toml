@@ -1,0 +1,40 @@
+# Changelog management with towncrier (https://towncrier.readthedocs.io).
+#
+# Every PR adds a news fragment to changelog.d/, named after its Jira ticket:
+#
+#     uvx towncrier create OSW-1234.feature.md -c "Added thread replies for status changes."
+#
+# For a change without a ticket, use an orphan fragment (no ticket link):
+#
+#     uvx towncrier create +reconciler-logs.misc.md -c "Improved reconciler logging."
+#
+# At release time the fragments are collected into CHANGELOG.md and deleted
+# (see "Releasing" in the README). CI fails a PR that adds no fragment.
+
+[tool.towncrier]
+name = "svab-slack-bot"
+directory = "changelog.d"
+filename = "CHANGELOG.md"
+start_string = "<!-- towncrier release notes start -->\n"
+title_format = "## [{version}] - {project_date}"
+issue_format = "[{issue}](https://rubinobs.atlassian.net/browse/{issue})"
+
+[[tool.towncrier.type]]
+directory = "feature"
+name = "Features"
+showcontent = true
+
+[[tool.towncrier.type]]
+directory = "bugfix"
+name = "Bug fixes"
+showcontent = true
+
+[[tool.towncrier.type]]
+directory = "doc"
+name = "Documentation"
+showcontent = true
+
+[[tool.towncrier.type]]
+directory = "misc"
+name = "Other changes"
+showcontent = true

@@ -1,0 +1,23 @@
+# Weekly dependency update PRs; CI checks each one. Updates are grouped into
+# one PR per ecosystem to keep the noise down.
+#
+# The Docker base images are not tracked: debian:bookworm-slim is pulled fresh
+# on every build, and the rust: image must be bumped together with
+# rust-toolchain.toml.
+version: 2
+updates:
+  - package-ecosystem: cargo
+    directory: /
+    schedule:
+      interval: weekly
+    groups:
+      cargo:
+        patterns: ["*"]
+
+  - package-ecosystem: github-actions
+    directory: /
+    schedule:
+      interval: weekly
+    groups:
+      github-actions:
+        patterns: ["*"]
