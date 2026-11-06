@@ -9,7 +9,7 @@ use std::sync::Arc;
 use axum::Router;
 use axum::body::Bytes;
 use axum::extract::{DefaultBodyLimit, State};
-use axum::http::{HeaderMap, StatusCode, header};
+use axum::http::{HeaderMap, StatusCode};
 use axum::routing::{get, post};
 use serde::Deserialize;
 use subtle::ConstantTimeEq;
@@ -18,6 +18,11 @@ use tokio::sync::{mpsc, oneshot};
 use crate::actor::Command;
 use crate::config::Config;
 use crate::error::WebhookError;
+
+/// Header carrying `SVAB_BOT_WEBHOOK_SECRET`. Not `Authorization`: behind
+/// the RSP ingress that header holds the Gafaelfawr token (which Gafaelfawr
+/// may also strip), so it can't carry our secret as well.
+pub const SECRET_HEADER: &str = "x-svab-bot-secret";
 
 /// Our payload is tiny; refuse anything bigger than this.
 const MAX_BODY_BYTES: usize = 4 * 1024;
@@ -40,10 +45,22 @@ impl AppState {
     }
 }
 
-pub fn router(state: AppState) -> Router {
-    Router::new()
+/// All routes, served under `path_prefix` when the ingress forwards requests
+/// with their full path (e.g. `/svab-slack-bot/jira/webhook`).
+pub fn router(state: AppState, path_prefix: Option<&str>) -> Router {
+    let routes = Router::new()
         .route("/healthz", get(healthz))
-        .route("/jira/webhook", post(jira_webhook))
+        .route("/jira/webhook", post(jira_webhook));
+    let routes = match path_prefix {
+        // Kubernetes probes call the pod directly, not through the ingress,
+        // so `/healthz` stays at the root as well. The webhook only exists
+        // under the prefix, so there is a single URL to configure in Jira.
+        Some(prefix) => Router::new()
+            .route("/healthz", get(healthz))
+            .nest(prefix, routes),
+        None => routes,
+    };
+    routes
         .layer(DefaultBodyLimit::max(MAX_BODY_BYTES))
         .with_state(state)
 }
@@ -66,7 +83,7 @@ async fn jira_webhook(
     // Authenticate before looking at the body at all. We take the body as raw
     // bytes (instead of axum's `Json` extractor) so that unauthenticated
     // callers always get 401, never a parsing error.
-    check_bearer(&headers, &state.webhook_secret)?;
+    check_secret(&headers, &state.webhook_secret)?;
 
     let payload: JiraWebhook = serde_json::from_slice(&body)
         .map_err(|err| WebhookError::BadRequest(format!("invalid JSON body: {err}")))?;
@@ -91,13 +108,12 @@ async fn jira_webhook(
     Ok(StatusCode::OK)
 }
 
-/// Check `Authorization: Bearer <secret>` in constant time, so response timing
-/// doesn't reveal how much of a guessed secret was right.
-fn check_bearer(headers: &HeaderMap, secret: &str) -> Result<(), WebhookError> {
+/// Check the [`SECRET_HEADER`] in constant time, so response timing doesn't
+/// reveal how much of a guessed secret was right.
+fn check_secret(headers: &HeaderMap, secret: &str) -> Result<(), WebhookError> {
     let token = headers
-        .get(header::AUTHORIZATION)
+        .get(SECRET_HEADER)
         .and_then(|value| value.to_str().ok())
-        .and_then(|value| value.strip_prefix("Bearer "))
         .ok_or(WebhookError::Unauthorized)?;
 
     if bool::from(token.as_bytes().ct_eq(secret.as_bytes())) {
@@ -144,23 +160,31 @@ mod tests {
     /// A router backed by a stand-in actor that answers every command with
     /// `result`, so these tests exercise only the HTTP layer.
     fn app_replying(result: fn() -> anyhow::Result<()>) -> Router {
+        app_with(None, result)
+    }
+
+    fn app_with(path_prefix: Option<&str>, result: fn() -> anyhow::Result<()>) -> Router {
         let (tx, mut rx) = mpsc::channel(8);
         tokio::spawn(async move {
             while let Some(Command::IssueChanged { reply, .. }) = rx.recv().await {
                 let _ = reply.send(result());
             }
         });
-        router(state(tx))
+        router(state(tx), path_prefix)
     }
 
     fn app() -> Router {
         app_replying(|| Ok(()))
     }
 
-    fn webhook(auth: Option<&str>, body: &str) -> Request<Body> {
-        let mut request = Request::post("/jira/webhook");
-        if let Some(auth) = auth {
-            request = request.header(header::AUTHORIZATION, auth);
+    fn webhook(secret: Option<&str>, body: &str) -> Request<Body> {
+        webhook_at("/jira/webhook", secret, body)
+    }
+
+    fn webhook_at(uri: &str, secret: Option<&str>, body: &str) -> Request<Body> {
+        let mut request = Request::post(uri);
+        if let Some(secret) = secret {
+            request = request.header(SECRET_HEADER, secret);
         }
         request.body(Body::from(body.to_string())).unwrap()
     }
@@ -178,10 +202,43 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn path_prefix_moves_the_webhook_but_keeps_root_healthz() {
+        let app = || app_with(Some("/svab-slack-bot"), || Ok(()));
+        let auth = SECRET;
+        let get = |uri: &str| Request::get(uri).body(Body::empty()).unwrap();
+
+        assert_eq!(
+            status(app(), get("/svab-slack-bot/healthz")).await,
+            StatusCode::OK
+        );
+        // For the Kubernetes probes, which don't go through the ingress.
+        assert_eq!(status(app(), get("/healthz")).await, StatusCode::OK);
+
+        let prefixed = webhook_at("/svab-slack-bot/jira/webhook", Some(auth), GOOD_BODY);
+        assert_eq!(status(app(), prefixed).await, StatusCode::OK);
+        let at_root = webhook_at("/jira/webhook", Some(auth), GOOD_BODY);
+        assert_eq!(status(app(), at_root).await, StatusCode::NOT_FOUND);
+    }
+
+    #[tokio::test]
     async fn accepts_authenticated_webhook() {
-        let auth = format!("Bearer {SECRET}");
-        let response = status(app(), webhook(Some(&auth), GOOD_BODY)).await;
+        let auth = SECRET;
+        let response = status(app(), webhook(Some(auth), GOOD_BODY)).await;
         assert_eq!(response, StatusCode::OK);
+    }
+
+    #[tokio::test]
+    async fn secret_in_authorization_header_is_not_accepted() {
+        // That header belongs to the ingress (Gafaelfawr); a request that
+        // only has the secret there must not get through.
+        let request = Request::post("/jira/webhook")
+            .header(
+                axum::http::header::AUTHORIZATION,
+                format!("Bearer {SECRET}"),
+            )
+            .body(Body::from(GOOD_BODY))
+            .unwrap();
+        assert_eq!(status(app(), request).await, StatusCode::UNAUTHORIZED);
     }
 
     #[tokio::test]
@@ -191,7 +248,7 @@ mod tests {
             StatusCode::UNAUTHORIZED
         );
         assert_eq!(
-            status(app(), webhook(Some("Bearer nope"), GOOD_BODY)).await,
+            status(app(), webhook(Some("nope"), GOOD_BODY)).await,
             StatusCode::UNAUTHORIZED
         );
         // Unauthenticated garbage gets 401 too, not a parsing error.
@@ -203,7 +260,7 @@ mod tests {
 
     #[tokio::test]
     async fn rejects_bad_payloads() {
-        let auth = format!("Bearer {SECRET}");
+        let auth = SECRET;
         for body in [
             "not json",
             r#"{"key": "SVAB-1"}"#,
@@ -211,7 +268,7 @@ mod tests {
             r#"{"issue_key": "SVAB-"}"#,
             r#"{"issue_key": "SVAB-1/../../x"}"#,
         ] {
-            let response = status(app(), webhook(Some(&auth), body)).await;
+            let response = status(app(), webhook(Some(auth), body)).await;
             assert_eq!(response, StatusCode::BAD_REQUEST, "body: {body}");
         }
     }
@@ -227,16 +284,16 @@ mod tests {
         })
         .unwrap();
 
-        let auth = format!("Bearer {SECRET}");
-        let response = status(router(state(tx)), webhook(Some(&auth), GOOD_BODY)).await;
+        let auth = SECRET;
+        let response = status(router(state(tx), None), webhook(Some(auth), GOOD_BODY)).await;
         assert_eq!(response, StatusCode::SERVICE_UNAVAILABLE);
     }
 
     #[tokio::test]
     async fn handling_failure_returns_500() {
         let app = app_replying(|| Err(anyhow::anyhow!("Jira is down")));
-        let auth = format!("Bearer {SECRET}");
-        let response = status(app, webhook(Some(&auth), GOOD_BODY)).await;
+        let auth = SECRET;
+        let response = status(app, webhook(Some(auth), GOOD_BODY)).await;
         assert_eq!(response, StatusCode::INTERNAL_SERVER_ERROR);
     }
 
@@ -245,8 +302,8 @@ mod tests {
         let (tx, rx) = mpsc::channel(1);
         drop(rx);
 
-        let auth = format!("Bearer {SECRET}");
-        let response = status(router(state(tx)), webhook(Some(&auth), GOOD_BODY)).await;
+        let auth = SECRET;
+        let response = status(router(state(tx), None), webhook(Some(auth), GOOD_BODY)).await;
         assert_eq!(response, StatusCode::INTERNAL_SERVER_ERROR);
     }
 }

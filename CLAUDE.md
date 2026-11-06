@@ -57,8 +57,10 @@ CI runs all of the above and fails a PR without a news fragment in
 
 ## Decided, don't revisit without asking
 
-- Event source is a Jira Automation web request with a bearer secret (not
-  polling, not Jira's native webhooks).
+- Event source is a Jira Automation web request with a shared secret in the
+  `X-Svab-Bot-Secret` header (not polling, not Jira's native webhooks). The
+  bot keeps checking it even behind an authenticating ingress (Gafaelfawr),
+  which owns the `Authorization` header.
 - Cutover from the Jira plugin uses the changelog time the ticket entered In
   Review vs `SVAB_BOT_ANNOUNCE_SINCE`. Tickets that went through review
   unannounced are logged, never announced late.

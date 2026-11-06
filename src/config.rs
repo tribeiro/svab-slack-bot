@@ -12,6 +12,8 @@ use std::net::SocketAddr;
 use std::time::Duration;
 
 use anyhow::{Context, bail};
+use base64::Engine;
+use base64::engine::general_purpose::STANDARD as BASE64;
 use jiff::Timestamp;
 
 /// Shortest webhook secret we accept. Generate one with `openssl rand -hex 32`.
@@ -21,7 +23,10 @@ const MIN_SECRET_LEN: usize = 32;
 pub struct Config {
     /// Address the HTTP server listens on (`SVAB_BOT_BIND_ADDR`, default `0.0.0.0:8080`).
     pub bind_addr: SocketAddr,
-    /// Shared secret that Jira Automation sends as `Authorization: Bearer <secret>`
+    /// Path the ingress serves the bot under, such as `/svab-slack-bot`
+    /// (`SVAB_BOT_PATH_PREFIX`, optional; unset serves from the root).
+    pub path_prefix: Option<String>,
+    /// Shared secret that Jira Automation sends in the `X-Svab-Bot-Secret` header
     /// (`SVAB_BOT_WEBHOOK_SECRET`, required).
     pub webhook_secret: String,
     /// Jira project key that webhook issue keys must belong to
@@ -47,9 +52,13 @@ pub struct JiraConfig {
     /// Scoped API tokens (e.g. Atlassian service accounts) must use
     /// `https://api.atlassian.com/ex/jira/<cloud-id>` instead.
     pub api_url: String,
-    /// Account the bot authenticates as (`SVAB_BOT_JIRA_EMAIL`, required).
+    /// Account the bot authenticates as (`SVAB_BOT_JIRA_EMAIL`).
     pub email: String,
-    /// API token for that account (`SVAB_BOT_JIRA_API_TOKEN`, required).
+    /// API token for that account (`SVAB_BOT_JIRA_API_TOKEN`).
+    ///
+    /// Instead of these two, `SVAB_BOT_JIRA_BASIC_CREDENTIALS` can hold both
+    /// as base64 of `email:token`, the value of an `Authorization: Basic`
+    /// header. Useful when the secret is only available in that form.
     pub api_token: String,
 }
 
@@ -100,6 +109,10 @@ impl Config {
             .parse()
             .context("SVAB_BOT_BIND_ADDR is not a valid socket address")?;
 
+        let path_prefix = lookup("SVAB_BOT_PATH_PREFIX")
+            .map(|prefix| parse_path_prefix(&prefix))
+            .transpose()?;
+
         let webhook_secret = required("SVAB_BOT_WEBHOOK_SECRET")?;
         if webhook_secret.len() < MIN_SECRET_LEN {
             bail!("SVAB_BOT_WEBHOOK_SECRET must be at least {MIN_SECRET_LEN} characters");
@@ -122,11 +135,28 @@ impl Config {
         let api_url = lookup("SVAB_BOT_JIRA_API_URL")
             .map(|url| url.trim_end_matches('/').to_string())
             .unwrap_or_else(|| site_url.clone());
+        let (email, api_token) = match lookup("SVAB_BOT_JIRA_BASIC_CREDENTIALS") {
+            Some(encoded) => {
+                if lookup("SVAB_BOT_JIRA_EMAIL").is_some()
+                    || lookup("SVAB_BOT_JIRA_API_TOKEN").is_some()
+                {
+                    bail!(
+                        "set either SVAB_BOT_JIRA_BASIC_CREDENTIALS or SVAB_BOT_JIRA_EMAIL and \
+                         SVAB_BOT_JIRA_API_TOKEN, not both"
+                    );
+                }
+                decode_basic_credentials(&encoded)?
+            }
+            None => (
+                required("SVAB_BOT_JIRA_EMAIL")?,
+                required("SVAB_BOT_JIRA_API_TOKEN")?,
+            ),
+        };
         let jira = JiraConfig {
             site_url,
             api_url,
-            email: required("SVAB_BOT_JIRA_EMAIL")?,
-            api_token: required("SVAB_BOT_JIRA_API_TOKEN")?,
+            email,
+            api_token,
         };
 
         let slack = SlackConfig {
@@ -159,6 +189,7 @@ impl Config {
 
         Ok(Self {
             bind_addr,
+            path_prefix,
             webhook_secret,
             jira_project,
             announce_since,
@@ -169,12 +200,46 @@ impl Config {
     }
 }
 
+/// Split `SVAB_BOT_JIRA_BASIC_CREDENTIALS` (base64 of `email:token`, with or
+/// without a leading `Basic `) into the email and the token. Errors never
+/// include the value, since it holds the token.
+fn decode_basic_credentials(encoded: &str) -> anyhow::Result<(String, String)> {
+    const NAME: &str = "SVAB_BOT_JIRA_BASIC_CREDENTIALS";
+    let encoded = encoded.strip_prefix("Basic ").unwrap_or(encoded).trim();
+    let decoded = BASE64
+        .decode(encoded)
+        .ok()
+        .and_then(|bytes| String::from_utf8(bytes).ok())
+        .with_context(|| format!("{NAME} is not valid base64"))?;
+    // Split on the first colon: the email can't contain one, the token might.
+    match decoded.split_once(':') {
+        Some((email, token)) if !email.trim().is_empty() && !token.trim().is_empty() => {
+            Ok((email.trim().to_string(), token.trim().to_string()))
+        }
+        _ => bail!("{NAME} must decode to email:token"),
+    }
+}
+
+/// Check `SVAB_BOT_PATH_PREFIX` now, so a bad value fails with a clear
+/// message instead of making the router panic. A trailing `/` is dropped.
+fn parse_path_prefix(prefix: &str) -> anyhow::Result<String> {
+    let trimmed = prefix.trim_end_matches('/');
+    if !prefix.starts_with('/') || trimmed.is_empty() || trimmed.contains(['{', '}', '*']) {
+        bail!(
+            "SVAB_BOT_PATH_PREFIX must be a path such as /svab-slack-bot \
+             (unset it to serve from the root), got {prefix:?}"
+        );
+    }
+    Ok(trimmed.to_string())
+}
+
 // Debug impls are hand-written so secrets never end up in logs.
 
 impl fmt::Debug for Config {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.debug_struct("Config")
             .field("bind_addr", &self.bind_addr)
+            .field("path_prefix", &self.path_prefix)
             .field("webhook_secret", &"<redacted>")
             .field("jira_project", &self.jira_project)
             .field("announce_since", &self.announce_since)
@@ -236,6 +301,7 @@ mod tests {
     fn defaults_apply() {
         let config = load(&required_vars()).unwrap();
         assert_eq!(config.bind_addr.to_string(), "0.0.0.0:8080");
+        assert_eq!(config.path_prefix, None);
         assert_eq!(config.jira_project, "SVAB");
         // Trailing slash trimmed, and the API URL defaults to the site URL.
         assert_eq!(config.jira.site_url, "https://example.atlassian.net");
@@ -319,6 +385,88 @@ mod tests {
             err.to_string()
                 .contains("SVAB_BOT_JIRA_API_TOKEN is not set")
         );
+    }
+
+    /// Required vars with the Jira credentials given as one encoded value.
+    fn basic_credentials_vars(decoded: &str) -> HashMap<&'static str, String> {
+        let mut vars: HashMap<_, _> = required_vars()
+            .into_iter()
+            .map(|(name, value)| (name, value.to_string()))
+            .collect();
+        vars.remove("SVAB_BOT_JIRA_EMAIL");
+        vars.remove("SVAB_BOT_JIRA_API_TOKEN");
+        vars.insert("SVAB_BOT_JIRA_BASIC_CREDENTIALS", BASE64.encode(decoded));
+        vars
+    }
+
+    fn load_owned(vars: &HashMap<&str, String>) -> anyhow::Result<Config> {
+        Config::from_lookup(|name| vars.get(name).cloned())
+    }
+
+    #[test]
+    fn basic_credentials_are_split_on_the_first_colon() {
+        // A colon in the token must stay in the token.
+        let vars = basic_credentials_vars("svab-bot@serviceaccount.atlassian.com:ATATT:tok=en");
+        let config = load_owned(&vars).unwrap();
+        assert_eq!(config.jira.email, "svab-bot@serviceaccount.atlassian.com");
+        assert_eq!(config.jira.api_token, "ATATT:tok=en");
+    }
+
+    #[test]
+    fn basic_credentials_accept_the_header_prefix() {
+        let mut vars = basic_credentials_vars("");
+        let encoded = BASE64.encode("bot@example.com:jira-token-value");
+        vars.insert(
+            "SVAB_BOT_JIRA_BASIC_CREDENTIALS",
+            format!("Basic {encoded}\n"),
+        );
+        let config = load_owned(&vars).unwrap();
+        assert_eq!(config.jira.email, "bot@example.com");
+        assert_eq!(config.jira.api_token, "jira-token-value");
+    }
+
+    #[test]
+    fn bad_basic_credentials_are_rejected_without_leaking_them() {
+        for decoded in ["no-colon-secret", ":only-a-secret", "bot@example.com:"] {
+            let vars = basic_credentials_vars(decoded);
+            let message = format!("{:#}", load_owned(&vars).unwrap_err());
+            assert!(message.contains("must decode to email:token"), "{message}");
+            assert!(!message.contains("secret"), "{decoded} leaked: {message}");
+        }
+
+        let mut vars = basic_credentials_vars("");
+        vars.insert(
+            "SVAB_BOT_JIRA_BASIC_CREDENTIALS",
+            "not base64 secret!".into(),
+        );
+        let message = format!("{:#}", load_owned(&vars).unwrap_err());
+        assert!(message.contains("not valid base64"), "{message}");
+        assert!(!message.contains("secret"), "{message}");
+    }
+
+    #[test]
+    fn basic_credentials_exclude_email_and_token() {
+        for name in ["SVAB_BOT_JIRA_EMAIL", "SVAB_BOT_JIRA_API_TOKEN"] {
+            let mut vars = basic_credentials_vars("bot@example.com:jira-token-value");
+            vars.insert(name, "x".into());
+            let message = load_owned(&vars).unwrap_err().to_string();
+            assert!(message.contains("not both"), "{name}: {message}");
+        }
+    }
+
+    #[test]
+    fn path_prefix_is_validated() {
+        let mut vars = required_vars();
+        vars.insert("SVAB_BOT_PATH_PREFIX", "/svab-slack-bot/");
+        let config = load(&vars).unwrap();
+        assert_eq!(config.path_prefix.as_deref(), Some("/svab-slack-bot"));
+
+        // "/" is the same as unset, so it's more likely a mistake.
+        for bad in ["svab-slack-bot", "/", "//", "/{issue}", "/bot/*rest"] {
+            vars.insert("SVAB_BOT_PATH_PREFIX", bad);
+            let message = load(&vars).unwrap_err().to_string();
+            assert!(message.contains("SVAB_BOT_PATH_PREFIX"), "{bad}: {message}");
+        }
     }
 
     #[test]
