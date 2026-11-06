@@ -109,8 +109,9 @@ and `status_emoji()` in `messages.rs`.
 | `SVAB_BOT_WEBHOOK_SECRET` | yes | | Bearer token Jira Automation must send (≥ 32 chars; `openssl rand -hex 32`) |
 | `SVAB_BOT_JIRA_SITE_URL` | yes | | e.g. `https://rubinobs.atlassian.net` (used for ticket links) |
 | `SVAB_BOT_JIRA_API_URL` | no | site URL | REST base URL; set to `https://api.atlassian.com/ex/jira/<cloud-id>` for scoped/service-account tokens |
-| `SVAB_BOT_JIRA_EMAIL` | yes | | Jira account the bot uses |
-| `SVAB_BOT_JIRA_API_TOKEN` | yes | | API token of that account |
+| `SVAB_BOT_JIRA_EMAIL` | yes¹ | | Jira account the bot uses |
+| `SVAB_BOT_JIRA_API_TOKEN` | yes¹ | | API token of that account |
+| `SVAB_BOT_JIRA_BASIC_CREDENTIALS` | no¹ | | Both of the above in one value: base64 of `email:token`, as in an `Authorization: Basic` header (a leading `Basic ` is accepted) |
 | `SVAB_BOT_SLACK_BOT_TOKEN` | yes | | Slack app bot token (`xoxb-…`) |
 | `SVAB_BOT_SLACK_CHANNEL_ID` | yes | | Channel to post in (`C…`) |
 | `SVAB_BOT_SLACK_APPROVERS_GROUP_ID` | yes | | User group ID of `@svab-approvers` (`S…`) |
@@ -121,6 +122,10 @@ and `status_emoji()` in `messages.rs`.
 | `SVAB_BOT_BIND_ADDR` | no | `0.0.0.0:8080` | HTTP listen address |
 | `SVAB_BOT_JIRA_PROJECT` | no | `SVAB` | Only issue keys from this project are accepted |
 | `RUST_LOG` | no | `info` | Log level/filter, e.g. `svab_slack_bot=debug` |
+
+¹ Set either `SVAB_BOT_JIRA_EMAIL` and `SVAB_BOT_JIRA_API_TOKEN`, or
+`SVAB_BOT_JIRA_BASIC_CREDENTIALS`, not both. The decoded email is logged at
+startup; the token never is.
 
 ### Accounts and permissions
 
