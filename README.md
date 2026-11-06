@@ -120,6 +120,7 @@ and `status_emoji()` in `messages.rs`.
 | `SVAB_BOT_RECONCILE_INTERVAL_MINUTES` | no | `15` | Time between reconcile passes |
 | `SVAB_BOT_RECONCILE_LOOKBACK_HOURS` | no | `72` | Tickets updated within this window are checked; must cover the interval |
 | `SVAB_BOT_BIND_ADDR` | no | `0.0.0.0:8080` | HTTP listen address |
+| `SVAB_BOT_PATH_PREFIX` | no | unset | Path the ingress serves the bot under, e.g. `/svab-slack-bot` when it forwards `/svab-slack-bot/...` unchanged. The webhook moves under it; `/healthz` answers both under it and at the root, for the Kubernetes probes |
 | `SVAB_BOT_JIRA_PROJECT` | no | `SVAB` | Only issue keys from this project are accepted |
 | `RUST_LOG` | no | `info` | Log level/filter, e.g. `svab_slack_bot=debug` |
 
@@ -229,7 +230,8 @@ curl -u "$SVAB_BOT_JIRA_EMAIL:$SVAB_BOT_JIRA_API_TOKEN" -X DELETE \
 
 - Trigger: *Work item transitioned* (project SVAB).
 - Action: *Send web request*.
-  - URL: `https://<host>/jira/webhook`
+  - URL: `https://<host><SVAB_BOT_PATH_PREFIX>/jira/webhook`, e.g.
+    `https://usdf-rsp.slac.stanford.edu/svab-slack-bot/jira/webhook`
   - Method: `POST`
   - Headers: `Authorization: Bearer <SVAB_BOT_WEBHOOK_SECRET>` (mark it as hidden), plus `Content-Type: application/json`
   - Body (custom data): `{"issue_key": "{{issue.key}}"}`
