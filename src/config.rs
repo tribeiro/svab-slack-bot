@@ -12,6 +12,8 @@ use std::net::SocketAddr;
 use std::time::Duration;
 
 use anyhow::{Context, bail};
+use base64::Engine;
+use base64::engine::general_purpose::STANDARD as BASE64;
 use jiff::Timestamp;
 
 /// Shortest webhook secret we accept. Generate one with `openssl rand -hex 32`.
@@ -47,9 +49,13 @@ pub struct JiraConfig {
     /// Scoped API tokens (e.g. Atlassian service accounts) must use
     /// `https://api.atlassian.com/ex/jira/<cloud-id>` instead.
     pub api_url: String,
-    /// Account the bot authenticates as (`SVAB_BOT_JIRA_EMAIL`, required).
+    /// Account the bot authenticates as (`SVAB_BOT_JIRA_EMAIL`).
     pub email: String,
-    /// API token for that account (`SVAB_BOT_JIRA_API_TOKEN`, required).
+    /// API token for that account (`SVAB_BOT_JIRA_API_TOKEN`).
+    ///
+    /// Instead of these two, `SVAB_BOT_JIRA_BASIC_CREDENTIALS` can hold both
+    /// as base64 of `email:token`, the value of an `Authorization: Basic`
+    /// header. Useful when the secret is only available in that form.
     pub api_token: String,
 }
 
@@ -122,11 +128,28 @@ impl Config {
         let api_url = lookup("SVAB_BOT_JIRA_API_URL")
             .map(|url| url.trim_end_matches('/').to_string())
             .unwrap_or_else(|| site_url.clone());
+        let (email, api_token) = match lookup("SVAB_BOT_JIRA_BASIC_CREDENTIALS") {
+            Some(encoded) => {
+                if lookup("SVAB_BOT_JIRA_EMAIL").is_some()
+                    || lookup("SVAB_BOT_JIRA_API_TOKEN").is_some()
+                {
+                    bail!(
+                        "set either SVAB_BOT_JIRA_BASIC_CREDENTIALS or SVAB_BOT_JIRA_EMAIL and \
+                         SVAB_BOT_JIRA_API_TOKEN, not both"
+                    );
+                }
+                decode_basic_credentials(&encoded)?
+            }
+            None => (
+                required("SVAB_BOT_JIRA_EMAIL")?,
+                required("SVAB_BOT_JIRA_API_TOKEN")?,
+            ),
+        };
         let jira = JiraConfig {
             site_url,
             api_url,
-            email: required("SVAB_BOT_JIRA_EMAIL")?,
-            api_token: required("SVAB_BOT_JIRA_API_TOKEN")?,
+            email,
+            api_token,
         };
 
         let slack = SlackConfig {
@@ -166,6 +189,26 @@ impl Config {
             slack,
             reconcile,
         })
+    }
+}
+
+/// Split `SVAB_BOT_JIRA_BASIC_CREDENTIALS` (base64 of `email:token`, with or
+/// without a leading `Basic `) into the email and the token. Errors never
+/// include the value, since it holds the token.
+fn decode_basic_credentials(encoded: &str) -> anyhow::Result<(String, String)> {
+    const NAME: &str = "SVAB_BOT_JIRA_BASIC_CREDENTIALS";
+    let encoded = encoded.strip_prefix("Basic ").unwrap_or(encoded).trim();
+    let decoded = BASE64
+        .decode(encoded)
+        .ok()
+        .and_then(|bytes| String::from_utf8(bytes).ok())
+        .with_context(|| format!("{NAME} is not valid base64"))?;
+    // Split on the first colon: the email can't contain one, the token might.
+    match decoded.split_once(':') {
+        Some((email, token)) if !email.trim().is_empty() && !token.trim().is_empty() => {
+            Ok((email.trim().to_string(), token.trim().to_string()))
+        }
+        _ => bail!("{NAME} must decode to email:token"),
     }
 }
 
@@ -319,6 +362,73 @@ mod tests {
             err.to_string()
                 .contains("SVAB_BOT_JIRA_API_TOKEN is not set")
         );
+    }
+
+    /// Required vars with the Jira credentials given as one encoded value.
+    fn basic_credentials_vars(decoded: &str) -> HashMap<&'static str, String> {
+        let mut vars: HashMap<_, _> = required_vars()
+            .into_iter()
+            .map(|(name, value)| (name, value.to_string()))
+            .collect();
+        vars.remove("SVAB_BOT_JIRA_EMAIL");
+        vars.remove("SVAB_BOT_JIRA_API_TOKEN");
+        vars.insert("SVAB_BOT_JIRA_BASIC_CREDENTIALS", BASE64.encode(decoded));
+        vars
+    }
+
+    fn load_owned(vars: &HashMap<&str, String>) -> anyhow::Result<Config> {
+        Config::from_lookup(|name| vars.get(name).cloned())
+    }
+
+    #[test]
+    fn basic_credentials_are_split_on_the_first_colon() {
+        // A colon in the token must stay in the token.
+        let vars = basic_credentials_vars("svab-bot@serviceaccount.atlassian.com:ATATT:tok=en");
+        let config = load_owned(&vars).unwrap();
+        assert_eq!(config.jira.email, "svab-bot@serviceaccount.atlassian.com");
+        assert_eq!(config.jira.api_token, "ATATT:tok=en");
+    }
+
+    #[test]
+    fn basic_credentials_accept_the_header_prefix() {
+        let mut vars = basic_credentials_vars("");
+        let encoded = BASE64.encode("bot@example.com:jira-token-value");
+        vars.insert(
+            "SVAB_BOT_JIRA_BASIC_CREDENTIALS",
+            format!("Basic {encoded}\n"),
+        );
+        let config = load_owned(&vars).unwrap();
+        assert_eq!(config.jira.email, "bot@example.com");
+        assert_eq!(config.jira.api_token, "jira-token-value");
+    }
+
+    #[test]
+    fn bad_basic_credentials_are_rejected_without_leaking_them() {
+        for decoded in ["no-colon-secret", ":only-a-secret", "bot@example.com:"] {
+            let vars = basic_credentials_vars(decoded);
+            let message = format!("{:#}", load_owned(&vars).unwrap_err());
+            assert!(message.contains("must decode to email:token"), "{message}");
+            assert!(!message.contains("secret"), "{decoded} leaked: {message}");
+        }
+
+        let mut vars = basic_credentials_vars("");
+        vars.insert(
+            "SVAB_BOT_JIRA_BASIC_CREDENTIALS",
+            "not base64 secret!".into(),
+        );
+        let message = format!("{:#}", load_owned(&vars).unwrap_err());
+        assert!(message.contains("not valid base64"), "{message}");
+        assert!(!message.contains("secret"), "{message}");
+    }
+
+    #[test]
+    fn basic_credentials_exclude_email_and_token() {
+        for name in ["SVAB_BOT_JIRA_EMAIL", "SVAB_BOT_JIRA_API_TOKEN"] {
+            let mut vars = basic_credentials_vars("bot@example.com:jira-token-value");
+            vars.insert(name, "x".into());
+            let message = load_owned(&vars).unwrap_err().to_string();
+            assert!(message.contains("not both"), "{name}: {message}");
+        }
     }
 
     #[test]
