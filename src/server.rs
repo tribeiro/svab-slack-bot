@@ -40,10 +40,22 @@ impl AppState {
     }
 }
 
-pub fn router(state: AppState) -> Router {
-    Router::new()
+/// All routes, served under `path_prefix` when the ingress forwards requests
+/// with their full path (e.g. `/svab-slack-bot/jira/webhook`).
+pub fn router(state: AppState, path_prefix: Option<&str>) -> Router {
+    let routes = Router::new()
         .route("/healthz", get(healthz))
-        .route("/jira/webhook", post(jira_webhook))
+        .route("/jira/webhook", post(jira_webhook));
+    let routes = match path_prefix {
+        // Kubernetes probes call the pod directly, not through the ingress,
+        // so `/healthz` stays at the root as well. The webhook only exists
+        // under the prefix, so there is a single URL to configure in Jira.
+        Some(prefix) => Router::new()
+            .route("/healthz", get(healthz))
+            .nest(prefix, routes),
+        None => routes,
+    };
+    routes
         .layer(DefaultBodyLimit::max(MAX_BODY_BYTES))
         .with_state(state)
 }
@@ -144,13 +156,17 @@ mod tests {
     /// A router backed by a stand-in actor that answers every command with
     /// `result`, so these tests exercise only the HTTP layer.
     fn app_replying(result: fn() -> anyhow::Result<()>) -> Router {
+        app_with(None, result)
+    }
+
+    fn app_with(path_prefix: Option<&str>, result: fn() -> anyhow::Result<()>) -> Router {
         let (tx, mut rx) = mpsc::channel(8);
         tokio::spawn(async move {
             while let Some(Command::IssueChanged { reply, .. }) = rx.recv().await {
                 let _ = reply.send(result());
             }
         });
-        router(state(tx))
+        router(state(tx), path_prefix)
     }
 
     fn app() -> Router {
@@ -158,7 +174,11 @@ mod tests {
     }
 
     fn webhook(auth: Option<&str>, body: &str) -> Request<Body> {
-        let mut request = Request::post("/jira/webhook");
+        webhook_at("/jira/webhook", auth, body)
+    }
+
+    fn webhook_at(uri: &str, auth: Option<&str>, body: &str) -> Request<Body> {
+        let mut request = Request::post(uri);
         if let Some(auth) = auth {
             request = request.header(header::AUTHORIZATION, auth);
         }
@@ -175,6 +195,25 @@ mod tests {
     async fn healthz_is_ok() {
         let request = Request::get("/healthz").body(Body::empty()).unwrap();
         assert_eq!(status(app(), request).await, StatusCode::OK);
+    }
+
+    #[tokio::test]
+    async fn path_prefix_moves_the_webhook_but_keeps_root_healthz() {
+        let app = || app_with(Some("/svab-slack-bot"), || Ok(()));
+        let auth = format!("Bearer {SECRET}");
+        let get = |uri: &str| Request::get(uri).body(Body::empty()).unwrap();
+
+        assert_eq!(
+            status(app(), get("/svab-slack-bot/healthz")).await,
+            StatusCode::OK
+        );
+        // For the Kubernetes probes, which don't go through the ingress.
+        assert_eq!(status(app(), get("/healthz")).await, StatusCode::OK);
+
+        let prefixed = webhook_at("/svab-slack-bot/jira/webhook", Some(&auth), GOOD_BODY);
+        assert_eq!(status(app(), prefixed).await, StatusCode::OK);
+        let at_root = webhook_at("/jira/webhook", Some(&auth), GOOD_BODY);
+        assert_eq!(status(app(), at_root).await, StatusCode::NOT_FOUND);
     }
 
     #[tokio::test]
@@ -228,7 +267,7 @@ mod tests {
         .unwrap();
 
         let auth = format!("Bearer {SECRET}");
-        let response = status(router(state(tx)), webhook(Some(&auth), GOOD_BODY)).await;
+        let response = status(router(state(tx), None), webhook(Some(&auth), GOOD_BODY)).await;
         assert_eq!(response, StatusCode::SERVICE_UNAVAILABLE);
     }
 
@@ -246,7 +285,7 @@ mod tests {
         drop(rx);
 
         let auth = format!("Bearer {SECRET}");
-        let response = status(router(state(tx)), webhook(Some(&auth), GOOD_BODY)).await;
+        let response = status(router(state(tx), None), webhook(Some(&auth), GOOD_BODY)).await;
         assert_eq!(response, StatusCode::INTERNAL_SERVER_ERROR);
     }
 }
