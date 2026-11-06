@@ -28,7 +28,7 @@ reconciler.rs (startup + every 15 min) ──────┤  same command, per 
                                         messages.rs (text)
 ```
 
-- **`server.rs`**: the HTTP layer. It checks the bearer secret, validates the
+- **`server.rs`**: the HTTP layer. It checks the webhook secret, validates the
   issue key, sends a `Command` to the actor, and waits for the reply on a
   `oneshot` channel. The reply becomes the HTTP status, so failures show up in
   the Jira Automation audit log.
@@ -87,7 +87,7 @@ post anything that isn't true.
 |---|---|
 | 200 | Event handled |
 | 400 | Body isn't `{"issue_key": "SVAB-<n>"}` |
-| 401 | Missing or wrong bearer secret |
+| 401 | Missing or wrong `X-Svab-Bot-Secret` header |
 | 500 | Handling failed (message in body) or actor not running |
 | 503 | Queue full; retry later |
 
@@ -106,7 +106,7 @@ and `status_emoji()` in `messages.rs`.
 
 | Variable | Required | Default | Description |
 |---|---|---|---|
-| `SVAB_BOT_WEBHOOK_SECRET` | yes | | Bearer token Jira Automation must send (≥ 32 chars; `openssl rand -hex 32`) |
+| `SVAB_BOT_WEBHOOK_SECRET` | yes | | Secret Jira Automation must send in the `X-Svab-Bot-Secret` header (≥ 32 chars; `openssl rand -hex 32`) |
 | `SVAB_BOT_JIRA_SITE_URL` | yes | | e.g. `https://rubinobs.atlassian.net` (used for ticket links) |
 | `SVAB_BOT_JIRA_API_URL` | no | site URL | REST base URL; set to `https://api.atlassian.com/ex/jira/<cloud-id>` for scoped/service-account tokens |
 | `SVAB_BOT_JIRA_EMAIL` | yes¹ | | Jira account the bot uses |
@@ -210,7 +210,7 @@ RUST_LOG=svab_slack_bot=debug cargo run
 # in another terminal
 curl -i localhost:8080/healthz
 curl -i -X POST localhost:8080/jira/webhook \
-  -H "Authorization: Bearer $SVAB_BOT_WEBHOOK_SECRET" \
+  -H "X-Svab-Bot-Secret: $SVAB_BOT_WEBHOOK_SECRET" \
   -d '{"issue_key": "SVAB-15"}'
 ```
 
@@ -233,7 +233,13 @@ curl -u "$SVAB_BOT_JIRA_EMAIL:$SVAB_BOT_JIRA_API_TOKEN" -X DELETE \
   - URL: `https://<host><SVAB_BOT_PATH_PREFIX>/jira/webhook`, e.g.
     `https://usdf-rsp.slac.stanford.edu/svab-slack-bot/jira/webhook`
   - Method: `POST`
-  - Headers: `Authorization: Bearer <SVAB_BOT_WEBHOOK_SECRET>` (mark it as hidden), plus `Content-Type: application/json`
+  - Headers (mark the first two as hidden):
+    - `X-Svab-Bot-Secret: <SVAB_BOT_WEBHOOK_SECRET>`
+    - `Authorization: Bearer <Gafaelfawr token>`, when the ingress requires
+      a scope (e.g. `read:image` on the RSP). Use a bot token from the RSP
+      admins, not a personal one, so it doesn't expire with your account.
+      The bot never sees this header: it keeps its own secret either way.
+    - `Content-Type: application/json`
   - Body (custom data): `{"issue_key": "{{issue.key}}"}`
 
 ## Development
