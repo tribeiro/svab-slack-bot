@@ -23,6 +23,9 @@ const MIN_SECRET_LEN: usize = 32;
 pub struct Config {
     /// Address the HTTP server listens on (`SVAB_BOT_BIND_ADDR`, default `0.0.0.0:8080`).
     pub bind_addr: SocketAddr,
+    /// Path the ingress serves the bot under, such as `/svab-slack-bot`
+    /// (`SVAB_BOT_PATH_PREFIX`, optional; unset serves from the root).
+    pub path_prefix: Option<String>,
     /// Shared secret that Jira Automation sends as `Authorization: Bearer <secret>`
     /// (`SVAB_BOT_WEBHOOK_SECRET`, required).
     pub webhook_secret: String,
@@ -106,6 +109,10 @@ impl Config {
             .parse()
             .context("SVAB_BOT_BIND_ADDR is not a valid socket address")?;
 
+        let path_prefix = lookup("SVAB_BOT_PATH_PREFIX")
+            .map(|prefix| parse_path_prefix(&prefix))
+            .transpose()?;
+
         let webhook_secret = required("SVAB_BOT_WEBHOOK_SECRET")?;
         if webhook_secret.len() < MIN_SECRET_LEN {
             bail!("SVAB_BOT_WEBHOOK_SECRET must be at least {MIN_SECRET_LEN} characters");
@@ -182,6 +189,7 @@ impl Config {
 
         Ok(Self {
             bind_addr,
+            path_prefix,
             webhook_secret,
             jira_project,
             announce_since,
@@ -212,12 +220,26 @@ fn decode_basic_credentials(encoded: &str) -> anyhow::Result<(String, String)> {
     }
 }
 
+/// Check `SVAB_BOT_PATH_PREFIX` now, so a bad value fails with a clear
+/// message instead of making the router panic. A trailing `/` is dropped.
+fn parse_path_prefix(prefix: &str) -> anyhow::Result<String> {
+    let trimmed = prefix.trim_end_matches('/');
+    if !prefix.starts_with('/') || trimmed.is_empty() || trimmed.contains(['{', '}', '*']) {
+        bail!(
+            "SVAB_BOT_PATH_PREFIX must be a path such as /svab-slack-bot \
+             (unset it to serve from the root), got {prefix:?}"
+        );
+    }
+    Ok(trimmed.to_string())
+}
+
 // Debug impls are hand-written so secrets never end up in logs.
 
 impl fmt::Debug for Config {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.debug_struct("Config")
             .field("bind_addr", &self.bind_addr)
+            .field("path_prefix", &self.path_prefix)
             .field("webhook_secret", &"<redacted>")
             .field("jira_project", &self.jira_project)
             .field("announce_since", &self.announce_since)
@@ -279,6 +301,7 @@ mod tests {
     fn defaults_apply() {
         let config = load(&required_vars()).unwrap();
         assert_eq!(config.bind_addr.to_string(), "0.0.0.0:8080");
+        assert_eq!(config.path_prefix, None);
         assert_eq!(config.jira_project, "SVAB");
         // Trailing slash trimmed, and the API URL defaults to the site URL.
         assert_eq!(config.jira.site_url, "https://example.atlassian.net");
@@ -428,6 +451,21 @@ mod tests {
             vars.insert(name, "x".into());
             let message = load_owned(&vars).unwrap_err().to_string();
             assert!(message.contains("not both"), "{name}: {message}");
+        }
+    }
+
+    #[test]
+    fn path_prefix_is_validated() {
+        let mut vars = required_vars();
+        vars.insert("SVAB_BOT_PATH_PREFIX", "/svab-slack-bot/");
+        let config = load(&vars).unwrap();
+        assert_eq!(config.path_prefix.as_deref(), Some("/svab-slack-bot"));
+
+        // "/" is the same as unset, so it's more likely a mistake.
+        for bad in ["svab-slack-bot", "/", "//", "/{issue}", "/bot/*rest"] {
+            vars.insert("SVAB_BOT_PATH_PREFIX", bad);
+            let message = load(&vars).unwrap_err().to_string();
+            assert!(message.contains("SVAB_BOT_PATH_PREFIX"), "{bad}: {message}");
         }
     }
 
