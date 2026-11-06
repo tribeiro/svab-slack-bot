@@ -26,7 +26,7 @@ pub struct Config {
     /// Path the ingress serves the bot under, such as `/svab-slack-bot`
     /// (`SVAB_BOT_PATH_PREFIX`, optional; unset serves from the root).
     pub path_prefix: Option<String>,
-    /// Shared secret that Jira Automation sends as `Authorization: Bearer <secret>`
+    /// Shared secret that Jira Automation sends in the `X-Svab-Bot-Secret` header
     /// (`SVAB_BOT_WEBHOOK_SECRET`, required).
     pub webhook_secret: String,
     /// Jira project key that webhook issue keys must belong to
