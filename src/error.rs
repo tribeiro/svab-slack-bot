@@ -5,7 +5,7 @@ use axum::response::{IntoResponse, Response};
 
 #[derive(Debug, thiserror::Error)]
 pub enum WebhookError {
-    #[error("missing or invalid bearer token")]
+    #[error("missing or invalid X-Svab-Bot-Secret header")]
     Unauthorized,
     #[error("invalid request: {0}")]
     BadRequest(String),
