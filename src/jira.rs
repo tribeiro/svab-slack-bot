@@ -10,7 +10,7 @@ use std::time::Duration;
 
 use anyhow::{Context, bail};
 use jiff::Timestamp;
-use reqwest::{Response, StatusCode};
+use reqwest::{RequestBuilder, Response, StatusCode};
 use serde::{Deserialize, Serialize};
 
 use crate::config::JiraConfig;
@@ -54,7 +54,7 @@ impl JiraClient {
         let response = self
             .http
             .get(format!("{}/rest/api/3/myself", self.config.api_url))
-            .basic_auth(&self.config.email, Some(&self.config.api_token))
+            .auth(&self.config)
             .send()
             .await;
         let me: RawUser = check_status(response)
@@ -69,12 +69,7 @@ impl JiraClient {
             self.config.api_url,
             REQUIRED_PERMISSIONS.join(",")
         );
-        let response = self
-            .http
-            .get(&url)
-            .basic_auth(&self.config.email, Some(&self.config.api_token))
-            .send()
-            .await;
+        let response = self.http.get(&url).auth(&self.config).send().await;
         let granted: RawPermissions = check_status(response)
             .await
             .context("GET /mypermissions")?
@@ -127,7 +122,7 @@ impl JiraClient {
             let response = self
                 .http
                 .post(&url)
-                .basic_auth(&self.config.email, Some(&self.config.api_token))
+                .auth(&self.config)
                 .json(&request)
                 .send()
                 .await;
@@ -165,12 +160,7 @@ impl JiraClient {
             self.config.api_url
         );
 
-        let response = self
-            .http
-            .get(&url)
-            .basic_auth(&self.config.email, Some(&self.config.api_token))
-            .send()
-            .await;
+        let response = self.http.get(&url).auth(&self.config).send().await;
         let raw: RawIssue = check_status(response)
             .await
             .with_context(|| format!("GET issue {key}"))?
@@ -186,7 +176,7 @@ impl JiraClient {
         let response = self
             .http
             .get(self.property_url(key))
-            .basic_auth(&self.config.email, Some(&self.config.api_token))
+            .auth(&self.config)
             .send()
             .await
             .with_context(|| format!("GET thread state of {key}"))?;
@@ -209,7 +199,7 @@ impl JiraClient {
         let response = self
             .http
             .put(self.property_url(key))
-            .basic_auth(&self.config.email, Some(&self.config.api_token))
+            .auth(&self.config)
             .json(state)
             .send()
             .await;
@@ -224,6 +214,22 @@ impl JiraClient {
             "{}/rest/api/3/issue/{key}/properties/{PROPERTY_KEY}",
             self.config.api_url
         )
+    }
+}
+
+/// Attach the bot's Jira credentials to a request.
+trait JiraAuth {
+    fn auth(self, config: &JiraConfig) -> Self;
+}
+
+impl JiraAuth for RequestBuilder {
+    /// Basic `email:token` when an email is configured (Jira Cloud API
+    /// tokens), otherwise `Authorization: Bearer <token>`.
+    fn auth(self, config: &JiraConfig) -> Self {
+        match &config.email {
+            Some(email) => self.basic_auth(email, Some(&config.api_token)),
+            None => self.bearer_auth(&config.api_token),
+        }
     }
 }
 
@@ -246,10 +252,11 @@ async fn check_status(response: reqwest::Result<Response>) -> anyhow::Result<Res
 
     if status == StatusCode::UNAUTHORIZED {
         bail!(
-            "Jira rejected the credentials (401): {detail}. Check that SVAB_BOT_JIRA_EMAIL \
-             is the Atlassian login of the account that owns SVAB_BOT_JIRA_API_TOKEN, and that \
-             the token hasn't expired. Scoped (e.g. service account) tokens also need \
-             SVAB_BOT_JIRA_API_URL=https://api.atlassian.com/ex/jira/<cloud-id>"
+            "Jira rejected the credentials (401): {detail}. Check that SVAB_BOT_JIRA_API_TOKEN \
+             hasn't expired, and that SVAB_BOT_JIRA_EMAIL is the Atlassian login of the \
+             account that owns it (without SVAB_BOT_JIRA_EMAIL the token is sent as a bearer \
+             token, which Jira Cloud API tokens don't accept). Scoped (e.g. service account) \
+             tokens also need SVAB_BOT_JIRA_API_URL=https://api.atlassian.com/ex/jira/<cloud-id>"
         );
     }
     bail!("Jira returned {status}: {detail}")
@@ -418,7 +425,9 @@ impl RawChangelog {
 pub mod tests {
     use super::*;
     use serde_json::json;
-    use wiremock::matchers::{basic_auth, body_json, body_partial_json, method, path, query_param};
+    use wiremock::matchers::{
+        basic_auth, bearer_token, body_json, body_partial_json, method, path, query_param,
+    };
     use wiremock::{Mock, MockServer, ResponseTemplate};
 
     use crate::svab::tests::example_issue;
@@ -491,10 +500,14 @@ pub mod tests {
     }
 
     async fn client(server: &MockServer) -> JiraClient {
+        client_with_email(server, Some("bot@example.com")).await
+    }
+
+    async fn client_with_email(server: &MockServer, email: Option<&str>) -> JiraClient {
         JiraClient::new(JiraConfig {
             site_url: "https://rubinobs.atlassian.net".into(),
             api_url: server.uri(),
-            email: "bot@example.com".into(),
+            email: email.map(Into::into),
             api_token: "token".into(),
         })
         .unwrap()
@@ -560,6 +573,34 @@ pub mod tests {
             .await
             .unwrap_err();
         assert!(format!("{err:#}").contains("Jira rejected the credentials"));
+    }
+
+    #[tokio::test]
+    async fn without_email_the_token_is_sent_as_bearer() {
+        let server = MockServer::start().await;
+        // Only bearer requests match; Basic auth would get a 404 and fail.
+        Mock::given(path("/rest/api/3/issue/SVAB-15"))
+            .and(bearer_token("token"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(svab_15_json()))
+            .expect(1)
+            .mount(&server)
+            .await;
+        Mock::given(method("PUT"))
+            .and(path("/rest/api/3/issue/SVAB-15/properties/svab-slack-bot"))
+            .and(bearer_token("token"))
+            .respond_with(ResponseTemplate::new(200))
+            .expect(1)
+            .mount(&server)
+            .await;
+
+        let jira = client_with_email(&server, None).await;
+        assert_eq!(jira.get_issue("SVAB-15").await.unwrap(), example_issue());
+        let state = ThreadState {
+            channel: "C123".into(),
+            thread_ts: "1700000000.000100".into(),
+            last_status: Status::InReview,
+        };
+        jira.set_thread_state("SVAB-15", &state).await.unwrap();
     }
 
     #[tokio::test]
