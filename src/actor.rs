@@ -178,7 +178,7 @@ mod tests {
         let jira = JiraClient::new(JiraConfig {
             site_url: "https://rubinobs.atlassian.net".into(),
             api_url: server.uri(),
-            email: "bot@example.com".into(),
+            email: Some("bot@example.com".into()),
             api_token: "token".into(),
         })
         .unwrap();
