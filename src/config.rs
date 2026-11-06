@@ -47,9 +47,11 @@ pub struct JiraConfig {
     /// Scoped API tokens (e.g. Atlassian service accounts) must use
     /// `https://api.atlassian.com/ex/jira/<cloud-id>` instead.
     pub api_url: String,
-    /// Account the bot authenticates as (`SVAB_BOT_JIRA_EMAIL`, required).
-    pub email: String,
-    /// API token for that account (`SVAB_BOT_JIRA_API_TOKEN`, required).
+    /// Account the bot authenticates as (`SVAB_BOT_JIRA_EMAIL`, optional).
+    /// Set: Basic auth with `email:api_token`, as Jira Cloud API tokens need.
+    /// Unset: the token is sent as `Authorization: Bearer <api_token>`.
+    pub email: Option<String>,
+    /// API token (`SVAB_BOT_JIRA_API_TOKEN`, required).
     pub api_token: String,
 }
 
@@ -125,7 +127,7 @@ impl Config {
         let jira = JiraConfig {
             site_url,
             api_url,
-            email: required("SVAB_BOT_JIRA_EMAIL")?,
+            email: lookup("SVAB_BOT_JIRA_EMAIL"),
             api_token: required("SVAB_BOT_JIRA_API_TOKEN")?,
         };
 
@@ -219,7 +221,6 @@ mod tests {
         HashMap::from([
             ("SVAB_BOT_WEBHOOK_SECRET", SECRET),
             ("SVAB_BOT_JIRA_SITE_URL", "https://example.atlassian.net/"),
-            ("SVAB_BOT_JIRA_EMAIL", "bot@example.com"),
             ("SVAB_BOT_JIRA_API_TOKEN", "jira-token-value"),
             ("SVAB_BOT_SLACK_BOT_TOKEN", "xoxb-slack-token-value"),
             ("SVAB_BOT_SLACK_CHANNEL_ID", "C123"),
@@ -241,6 +242,8 @@ mod tests {
         assert_eq!(config.jira.site_url, "https://example.atlassian.net");
         assert_eq!(config.jira.api_url, "https://example.atlassian.net");
         assert_eq!(config.announce_since, None);
+        // No email: the token is used as a bearer token.
+        assert_eq!(config.jira.email, None);
         assert_eq!(config.reconcile.interval, Duration::from_secs(15 * 60));
         assert_eq!(config.reconcile.lookback_hours, 72);
     }
@@ -311,7 +314,11 @@ mod tests {
         let mut vars = required_vars();
         vars.insert("SVAB_BOT_JIRA_EMAIL", "  bot@example.com\n");
         let config = load(&vars).unwrap();
-        assert_eq!(config.jira.email, "bot@example.com");
+        assert_eq!(config.jira.email.as_deref(), Some("bot@example.com"));
+
+        // A blank email means bearer auth, not Basic auth with an empty user.
+        vars.insert("SVAB_BOT_JIRA_EMAIL", " \n");
+        assert_eq!(load(&vars).unwrap().jira.email, None);
 
         vars.insert("SVAB_BOT_JIRA_API_TOKEN", " \n");
         let err = load(&vars).unwrap_err();
