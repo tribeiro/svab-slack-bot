@@ -71,7 +71,7 @@ async fn main() -> anyhow::Result<()> {
     let mut actor_task = tokio::spawn(actor.run());
     let mut reconciler_task = tokio::spawn(reconciler.run());
 
-    let app = server::router(AppState::new(tx, &config));
+    let app = server::router(AppState::new(tx, &config), config.path_prefix.as_deref());
     let listener = TcpListener::bind(config.bind_addr)
         .await
         .with_context(|| format!("failed to bind {}", config.bind_addr))?;
