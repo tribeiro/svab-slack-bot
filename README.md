@@ -109,8 +109,8 @@ and `status_emoji()` in `messages.rs`.
 | `SVAB_BOT_WEBHOOK_SECRET` | yes | | Bearer token Jira Automation must send (≥ 32 chars; `openssl rand -hex 32`) |
 | `SVAB_BOT_JIRA_SITE_URL` | yes | | e.g. `https://rubinobs.atlassian.net` (used for ticket links) |
 | `SVAB_BOT_JIRA_API_URL` | no | site URL | REST base URL; set to `https://api.atlassian.com/ex/jira/<cloud-id>` for scoped/service-account tokens |
-| `SVAB_BOT_JIRA_EMAIL` | yes | | Jira account the bot uses |
-| `SVAB_BOT_JIRA_API_TOKEN` | yes | | API token of that account |
+| `SVAB_BOT_JIRA_EMAIL` | no | | Atlassian login of the token's account; set it for Basic auth (`email:token`), leave it unset to send the token as `Authorization: Bearer` |
+| `SVAB_BOT_JIRA_API_TOKEN` | yes | | API token the bot authenticates with |
 | `SVAB_BOT_SLACK_BOT_TOKEN` | yes | | Slack app bot token (`xoxb-…`) |
 | `SVAB_BOT_SLACK_CHANNEL_ID` | yes | | Channel to post in (`C…`) |
 | `SVAB_BOT_SLACK_APPROVERS_GROUP_ID` | yes | | User group ID of `@svab-approvers` (`S…`) |
@@ -160,6 +160,17 @@ curl -s -o /dev/null -w '%{http_code}\n' -u "$SVAB_BOT_JIRA_EMAIL:$SVAB_BOT_JIRA
   expired.
 - **401 here, but 200 via `https://api.atlassian.com/ex/jira/<cloud-id>`**:
   the token is scoped. Set `SVAB_BOT_JIRA_API_URL` to that gateway URL.
+
+To use a token without an email, check that Jira accepts it as a bearer
+token (`200`) before leaving `SVAB_BOT_JIRA_EMAIL` unset. Jira Cloud API
+tokens usually need the email.
+
+```sh
+curl -s -o /dev/null -w '%{http_code}\n' -H "Authorization: Bearer $SVAB_BOT_JIRA_API_TOKEN" \
+  "$SVAB_BOT_JIRA_API_URL/rest/api/3/myself"
+```
+
+The cloud ID for the gateway URL is in `$SVAB_BOT_JIRA_SITE_URL/_edge/tenant_info`.
 
 ## Cutover from the Jira plugin
 
